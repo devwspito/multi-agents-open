@@ -15,7 +15,8 @@ import { connectDatabase, closeDatabase } from './database/index.js';
 import { providerFactory } from './services/providers/ProviderFactory.js';
 import { agentExecutor } from './services/agents/AgentExecutorService.js';
 import { trainingExportService } from './services/training/TrainingExportService.js';
-import { executionTracker } from './services/training/ExecutionTracker.js';
+import { TaskRepository } from './database/repositories/TaskRepository.js';
+import { toolDefinitions, toolHandlers } from './tools/index.js';
 
 const PORT = parseInt(process.env.PORT || '3001');
 
@@ -60,6 +61,130 @@ async function main() {
   });
 
   // ===========================================
+  // Task Management Endpoints
+  // ===========================================
+
+  /**
+   * Create a task
+   * POST /api/tasks
+   */
+  app.post('/api/tasks', (req, res) => {
+    try {
+      const { projectId, title, description } = req.body;
+
+      if (!title) {
+        return res.status(400).json({ error: 'Missing required field: title' });
+      }
+
+      const task = TaskRepository.create({ projectId, title, description });
+      res.status(201).json(task);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * Get all tasks
+   * GET /api/tasks
+   */
+  app.get('/api/tasks', (req, res) => {
+    try {
+      const { projectId, status, limit, offset } = req.query;
+
+      const tasks = TaskRepository.findAll({
+        projectId: projectId as string,
+        status: status as any,
+        limit: limit ? parseInt(limit as string) : undefined,
+        offset: offset ? parseInt(offset as string) : undefined,
+      });
+
+      res.json(tasks);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * Get a task by ID
+   * GET /api/tasks/:taskId
+   */
+  app.get('/api/tasks/:taskId', (req, res) => {
+    try {
+      const { taskId } = req.params;
+      const task = TaskRepository.findById(taskId);
+
+      if (!task) {
+        return res.status(404).json({ error: 'Task not found' });
+      }
+
+      res.json(task);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * Update a task
+   * PUT /api/tasks/:taskId
+   */
+  app.put('/api/tasks/:taskId', (req, res) => {
+    try {
+      const { taskId } = req.params;
+      const { title, description, status } = req.body;
+
+      const task = TaskRepository.update(taskId, { title, description, status });
+
+      if (!task) {
+        return res.status(404).json({ error: 'Task not found' });
+      }
+
+      res.json(task);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * Delete a task
+   * DELETE /api/tasks/:taskId
+   */
+  app.delete('/api/tasks/:taskId', (req, res) => {
+    try {
+      const { taskId } = req.params;
+      const deleted = TaskRepository.delete(taskId);
+
+      if (!deleted) {
+        return res.status(404).json({ error: 'Task not found' });
+      }
+
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * Get task statistics
+   * GET /api/tasks/stats/summary
+   */
+  app.get('/api/tasks/stats/summary', (req, res) => {
+    try {
+      const stats = TaskRepository.getStats();
+      res.json(stats);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * Get available tools
+   * GET /api/tools
+   */
+  app.get('/api/tools', (req, res) => {
+    res.json(toolDefinitions);
+  });
+
+  // ===========================================
   // Agent Execution Endpoints
   // ===========================================
 
@@ -74,9 +199,6 @@ async function main() {
       if (!taskId || !agentType || !prompt) {
         return res.status(400).json({ error: 'Missing required fields: taskId, agentType, prompt' });
       }
-
-      // Create tool handlers map (empty for now - tools implemented separately)
-      const toolHandlers = new Map();
 
       const result = await agentExecutor.execute(
         {
@@ -249,15 +371,29 @@ async function main() {
   httpServer.listen(PORT, () => {
     console.log('='.repeat(60));
     console.log(` Server running on http://localhost:${PORT}`);
-    console.log(' Endpoints:');
-    console.log('   GET  /health                  - Health check');
+    console.log(' ');
+    console.log(' Task Endpoints:');
+    console.log('   POST /api/tasks               - Create task');
+    console.log('   GET  /api/tasks               - List tasks');
+    console.log('   GET  /api/tasks/:id           - Get task');
+    console.log('   PUT  /api/tasks/:id           - Update task');
+    console.log('   DELETE /api/tasks/:id         - Delete task');
+    console.log(' ');
+    console.log(' Agent Endpoints:');
     console.log('   POST /api/agents/execute      - Execute agent');
     console.log('   POST /api/agents/cancel       - Cancel execution');
     console.log('   GET  /api/tasks/:id/history   - Execution history');
     console.log('   GET  /api/tasks/:id/stats     - Execution stats');
+    console.log(' ');
+    console.log(' Training Endpoints:');
     console.log('   GET  /api/training/export/:id - Export task data');
     console.log('   GET  /api/training/export-jsonl - Export JSONL');
     console.log('   GET  /api/training/stats      - Export stats');
+    console.log(' ');
+    console.log(' Other:');
+    console.log('   GET  /api/tools               - Available tools');
+    console.log('   GET  /api/providers/health    - Provider health');
+    console.log('   GET  /health                  - Server health');
     console.log('='.repeat(60));
   });
 
