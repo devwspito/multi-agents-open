@@ -3,10 +3,11 @@
  *
  * Analyzes the task requirements and codebase to understand
  * what needs to be done.
+ *
+ * Uses OpenCode SDK for agent execution.
  */
 
-import { BasePhase, PhaseContext, PhaseResult } from '../Phase.js';
-import { AgentExecutionResponse } from '../../types/index.js';
+import { BasePhase, PhaseContext, PhaseResult, OpenCodeExecutionResult } from '../Phase.js';
 
 export class AnalysisPhase extends BasePhase {
   readonly name = 'Analysis';
@@ -55,19 +56,21 @@ You excel at:
 Be thorough but concise. Focus on actionable insights.`;
   }
 
-  async processOutput(output: AgentExecutionResponse, context: PhaseContext): Promise<PhaseResult> {
+  async processOutput(result: OpenCodeExecutionResult, context: PhaseContext): Promise<PhaseResult> {
     // Store analysis in context for later phases
-    context.variables.set('analysis', output.finalOutput);
+    context.variables.set('analysis', result.finalOutput);
 
     return {
       success: true,
       output: {
-        analysis: output.finalOutput,
-        toolsUsed: output.toolCalls.map(tc => tc.toolName),
+        analysis: result.finalOutput,
+        toolsUsed: result.toolCalls.map(tc => tc.toolName),
       },
       metadata: {
-        turns: output.turns,
-        tokens: output.usage.totalTokens,
+        sessionId: result.sessionId,
+        turns: result.turns,
+        toolCalls: result.toolCalls.length,
+        vulnerabilities: result.vulnerabilities.length,
       },
     };
   }

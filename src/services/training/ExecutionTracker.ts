@@ -3,11 +3,27 @@
  *
  * Coordinates granular tracking of agent executions.
  * Provider-agnostic - works with OpenCode, Ollama, DGX, etc.
+ *
+ * Now includes ML Security Analyzer integration for:
+ * - Tool call chain tracking
+ * - Prompt classification
+ * - Git context capture
+ * - Error recovery patterns
  */
 
 import { AgentExecutionRepository, IAgentExecution } from '../../database/repositories/AgentExecutionRepository.js';
 import { AgentTurnRepository, IAgentTurn, TurnType } from '../../database/repositories/AgentTurnRepository.js';
 import { ToolCallRepository, IToolCall } from '../../database/repositories/ToolCallRepository.js';
+
+// Lazy import to avoid circular dependencies
+let mlAnalyzer: any = null;
+const getMLAnalyzer = async () => {
+  if (!mlAnalyzer) {
+    const module = await import('./MLSecurityAnalyzer.js');
+    mlAnalyzer = module.mlSecurityAnalyzer;
+  }
+  return mlAnalyzer;
+};
 
 interface ActiveExecution {
   executionId: string;
@@ -15,6 +31,11 @@ interface ActiveExecution {
   currentTurnId: string | null;
   currentTurnNumber: number;
   pendingToolCalls: Map<string, string>; // toolUseId -> toolCallId
+  // ML tracking
+  workspacePath?: string;
+  agentType?: string;
+  lastError?: string;
+  lastErrorType?: string;
 }
 
 class ExecutionTrackerService {
@@ -29,6 +50,7 @@ class ExecutionTrackerService {
     modelId: string;
     phaseName?: string;
     prompt: string;
+    workspacePath?: string;
   }): string {
     const execution = AgentExecutionRepository.create(params);
 
@@ -38,10 +60,40 @@ class ExecutionTrackerService {
       currentTurnId: null,
       currentTurnNumber: 0,
       pendingToolCalls: new Map(),
+      workspacePath: params.workspacePath,
+      agentType: params.agentType,
     });
 
     console.log(`[ExecutionTracker] Started execution ${execution.id} for task ${params.taskId}`);
+
+    // ML: Record prompt classification and git context (async, non-blocking)
+    this.recordMLContextAsync(params.taskId, execution.id, params.prompt, params.workspacePath);
+
     return execution.id;
+  }
+
+  /**
+   * Record ML context (prompt classification + git context)
+   */
+  private async recordMLContextAsync(
+    taskId: string,
+    executionId: string,
+    prompt: string,
+    workspacePath?: string
+  ): Promise<void> {
+    try {
+      const analyzer = await getMLAnalyzer();
+
+      // Classify prompt
+      analyzer.recordPromptClassification({ taskId, executionId, prompt });
+
+      // Capture git context if workspace available
+      if (workspacePath) {
+        await analyzer.recordGitContext({ taskId, executionId, workspacePath });
+      }
+    } catch (error: any) {
+      console.warn(`[ExecutionTracker] ML context error: ${error.message}`);
+    }
   }
 
   /**
@@ -111,7 +163,27 @@ class ExecutionTrackerService {
     const currentCount = active.pendingToolCalls.size;
     AgentTurnRepository.updateToolCalls(active.currentTurnId, currentCount);
 
+    // ML: Track tool sequence for chain analysis (async, non-blocking)
+    this.trackToolCallMLAsync(taskId, active.executionId, params.toolName, params.toolInput);
+
     return toolCall.id;
+  }
+
+  /**
+   * Track tool call for ML chain analysis
+   */
+  private async trackToolCallMLAsync(
+    taskId: string,
+    executionId: string,
+    toolName: string,
+    toolInput: any
+  ): Promise<void> {
+    try {
+      const analyzer = await getMLAnalyzer();
+      analyzer.trackToolCall({ taskId, executionId, toolName, toolInput });
+    } catch (error: any) {
+      console.warn(`[ExecutionTracker] ML tool tracking error: ${error.message}`);
+    }
   }
 
   /**
@@ -119,6 +191,7 @@ class ExecutionTrackerService {
    */
   completeToolCall(taskId: string, params: {
     toolUseId: string;
+    toolName?: string;
     toolOutput?: string;
     toolSuccess: boolean;
     toolError?: string;
@@ -140,7 +213,65 @@ class ExecutionTrackerService {
       bashExitCode: params.bashExitCode,
     });
 
+    // ML: Track errors for recovery pattern analysis
+    if (!params.toolSuccess && params.toolError) {
+      active.lastError = params.toolError;
+      active.lastErrorType = params.toolName || 'unknown';
+    }
+
     active.pendingToolCalls.delete(params.toolUseId);
+  }
+
+  /**
+   * Update turn content - also checks for error recovery
+   */
+  updateTurnContentWithRecovery(taskId: string, content: string, tokens?: { input: number; output: number }): void {
+    const active = this.activeExecutions.get(taskId);
+    if (!active?.currentTurnId) return;
+
+    AgentTurnRepository.updateContent(active.currentTurnId, content, tokens);
+
+    // ML: Track error recovery if there was a previous error
+    if (active.lastError && content.length > 0) {
+      this.trackErrorRecoveryMLAsync(
+        taskId,
+        active.executionId,
+        active.lastError,
+        active.lastErrorType || 'unknown',
+        content
+      );
+      active.lastError = undefined;
+      active.lastErrorType = undefined;
+    }
+  }
+
+  /**
+   * Track error recovery attempt
+   */
+  private async trackErrorRecoveryMLAsync(
+    taskId: string,
+    executionId: string,
+    error: string,
+    errorType: string,
+    recoveryContent: string
+  ): Promise<void> {
+    try {
+      const analyzer = await getMLAnalyzer();
+      const recoveryMatch = recoveryContent.match(/(?:let me|I'll|I will)\s+(?:try|use|run)\s+(\w+)/i);
+      const recoveryTool = recoveryMatch ? recoveryMatch[1] : 'text_response';
+
+      analyzer.trackErrorRecovery({
+        taskId,
+        executionId,
+        error,
+        errorType,
+        recoveryAction: recoveryContent.substring(0, 200),
+        recoveryToolName: recoveryTool,
+        successful: true,
+      });
+    } catch (error: any) {
+      console.warn(`[ExecutionTracker] ML recovery tracking error: ${error.message}`);
+    }
   }
 
   /**
@@ -160,8 +291,23 @@ class ExecutionTrackerService {
       turnsCompleted: active.currentTurnNumber,
     });
 
+    // ML: Clear tracking state
+    this.clearMLTrackingAsync(active.executionId);
+
     this.activeExecutions.delete(taskId);
     console.log(`[ExecutionTracker] Completed execution ${active.executionId} - ${active.currentTurnNumber} turns`);
+  }
+
+  /**
+   * Clear ML tracking state for an execution
+   */
+  private async clearMLTrackingAsync(executionId: string): Promise<void> {
+    try {
+      const analyzer = await getMLAnalyzer();
+      analyzer.clearExecution(executionId);
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 
   /**
@@ -172,6 +318,10 @@ class ExecutionTrackerService {
     if (!active) return;
 
     AgentExecutionRepository.fail(active.executionId, errorMessage, errorType);
+
+    // ML: Clear tracking state
+    this.clearMLTrackingAsync(active.executionId);
+
     this.activeExecutions.delete(taskId);
     console.log(`[ExecutionTracker] Failed execution ${active.executionId}: ${errorMessage}`);
   }

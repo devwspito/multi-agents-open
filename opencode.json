@@ -1,0 +1,64 @@
+{
+  "$schema": "https://opencode.ai/schema/opencode.json",
+  "providers": {
+    "dgx-spark": {
+      "type": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "${OPENCODE_DGX_URL:-http://localhost:8080/v1}",
+        "name": "DGX Spark"
+      },
+      "models": {
+        "llama-3.3-70b": {
+          "id": "llama-3.3-70b-instruct"
+        },
+        "llama-3.1-8b": {
+          "id": "llama-3.1-8b-instruct"
+        },
+        "deepseek-r1": {
+          "id": "deepseek-r1"
+        }
+      }
+    },
+    "ollama": {
+      "type": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "${OPENCODE_OLLAMA_URL:-http://localhost:11434/v1}",
+        "name": "Ollama"
+      },
+      "models": {
+        "qwen-coder": {
+          "id": "qwen2.5-coder:32b"
+        },
+        "llama3": {
+          "id": "llama3.2:latest"
+        },
+        "codellama": {
+          "id": "codellama:34b"
+        }
+      }
+    }
+  },
+  "agents": {
+    "analyst": {
+      "name": "Code Analyst",
+      "model": "dgx-spark/llama-3.3-70b",
+      "systemPrompt": "You are a code analyst agent. Analyze tasks and codebases thoroughly.",
+      "tools": ["read", "glob", "grep"]
+    },
+    "developer": {
+      "name": "Developer",
+      "model": "dgx-spark/llama-3.3-70b",
+      "systemPrompt": "You are a senior software developer agent. Implement code changes efficiently.",
+      "tools": ["read", "write", "edit", "bash", "glob", "grep"]
+    },
+    "reviewer": {
+      "name": "Code Reviewer",
+      "model": "dgx-spark/llama-3.3-70b",
+      "systemPrompt": "You are a code reviewer. Review changes for quality, security, and best practices.",
+      "tools": ["read", "glob", "grep"]
+    }
+  },
+  "mcp": {
+    "servers": {}
+  }
+}

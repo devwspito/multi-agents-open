@@ -1,8 +1,9 @@
 /**
  * Open Multi-Agents
  *
- * Multi-Agent Development Platform with DGX Spark
- * Provider-agnostic design for flexibility.
+ * Multi-Agent Development Platform powered by OpenCode SDK.
+ * OpenCode handles: LLM calls, tools, retries, context management.
+ * We handle: Orchestration, tracking, security monitoring, ML export.
  */
 
 import 'dotenv/config';
@@ -12,29 +13,36 @@ import { Server as SocketIOServer } from 'socket.io';
 import { createServer } from 'http';
 
 import { connectDatabase, closeDatabase } from './database/index.js';
-import { providerFactory } from './services/providers/ProviderFactory.js';
-import { agentExecutor } from './services/agents/AgentExecutorService.js';
+import { openCodeClient } from './services/opencode/OpenCodeClient.js';
+import { executionTracker } from './services/training/ExecutionTracker.js';
 import { trainingExportService } from './services/training/TrainingExportService.js';
+import { sentinentalWebhook } from './services/training/SentinentalWebhook.js';
 import { TaskRepository } from './database/repositories/TaskRepository.js';
-import { toolDefinitions, toolHandlers } from './tools/index.js';
+import { agentSpy } from './services/security/AgentSpy.js';
+import { orchestrator, initializePipelines } from './orchestration/index.js';
 
 const PORT = parseInt(process.env.PORT || '3001');
 
 async function main() {
   console.log('='.repeat(60));
   console.log(' Open Multi-Agents - Starting Server');
+  console.log(' Powered by OpenCode SDK');
   console.log('='.repeat(60));
 
   // Initialize database
   await connectDatabase();
 
-  // Initialize default provider
+  // Initialize pipelines
+  initializePipelines();
+
+  // Connect to OpenCode server
   try {
-    const provider = await providerFactory.getDefault();
-    console.log(`[Server] LLM Provider: ${provider.type} (${provider.model})`);
+    await openCodeClient.connect();
+    console.log('[Server] Connected to OpenCode');
   } catch (error: any) {
-    console.warn(`[Server] Warning: Could not initialize LLM provider: ${error.message}`);
-    console.warn('[Server] Agent execution will fail until provider is available');
+    console.warn(`[Server] Warning: Could not connect to OpenCode: ${error.message}`);
+    console.warn('[Server] Agent execution will fail until OpenCode is available');
+    console.warn('[Server] Start OpenCode with: opencode serve');
   }
 
   // Create Express app
@@ -52,11 +60,12 @@ async function main() {
 
   // Health check endpoint
   app.get('/health', async (req, res) => {
-    const providerHealth = await providerFactory.healthCheckAll();
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
-      providers: providerHealth,
+      opencode: {
+        connected: openCodeClient.isConnected(),
+      },
     });
   });
 
@@ -176,78 +185,91 @@ async function main() {
     }
   });
 
-  /**
-   * Get available tools
-   * GET /api/tools
-   */
-  app.get('/api/tools', (req, res) => {
-    res.json(toolDefinitions);
-  });
-
   // ===========================================
-  // Agent Execution Endpoints
+  // Orchestration Endpoints (OpenCode-powered)
   // ===========================================
 
   /**
-   * Execute an agent
-   * POST /api/agents/execute
+   * Run a pipeline for a task
+   * POST /api/orchestration/run
    */
-  app.post('/api/agents/execute', async (req, res) => {
+  app.post('/api/orchestration/run', async (req, res) => {
     try {
-      const { taskId, agentType, phaseName, prompt, systemPrompt, tools, maxTurns, temperature } = req.body;
+      const { taskId, pipeline, projectPath } = req.body;
 
-      if (!taskId || !agentType || !prompt) {
-        return res.status(400).json({ error: 'Missing required fields: taskId, agentType, prompt' });
+      if (!taskId || !pipeline) {
+        return res.status(400).json({ error: 'Missing required fields: taskId, pipeline' });
       }
 
-      const result = await agentExecutor.execute(
-        {
-          taskId,
-          agentType,
-          phaseName,
-          prompt,
-          systemPrompt,
-          tools,
-          maxTurns,
-          temperature,
+      // Get task
+      const task = TaskRepository.findById(taskId);
+      if (!task) {
+        return res.status(404).json({ error: 'Task not found' });
+      }
+
+      // Update task status
+      TaskRepository.updateStatus(taskId, 'running');
+
+      // Emit start event
+      io.to(taskId).emit('pipeline_start', { pipeline, taskId });
+
+      // Run pipeline
+      const result = await orchestrator.execute(taskId, pipeline, {
+        projectPath: projectPath || process.cwd(),
+        onPhaseStart: (phaseName) => {
+          io.to(taskId).emit('phase_start', { phaseName });
         },
-        {
-          toolHandlers,
-          onTurnStart: (turn) => {
-            io.to(taskId).emit('turn_start', { turn });
-          },
-          onContent: (content) => {
-            io.to(taskId).emit('content', { content });
-          },
-          onToolCall: (toolName, input) => {
-            io.to(taskId).emit('tool_call', { toolName, input });
-          },
-          onToolResult: (toolName, result) => {
-            io.to(taskId).emit('tool_result', { toolName, ...result });
-          },
-        }
-      );
+        onPhaseComplete: (phaseName, phaseResult) => {
+          io.to(taskId).emit('phase_complete', { phaseName, success: phaseResult.success });
+        },
+      });
+
+      // Status is already updated by orchestrator
+
+      // Emit completion event
+      io.to(taskId).emit('pipeline_complete', { success: result.success, result });
 
       res.json(result);
     } catch (error: any) {
-      console.error('[API] Agent execution error:', error);
+      console.error('[API] Pipeline execution error:', error);
       res.status(500).json({ error: error.message });
     }
   });
 
   /**
-   * Cancel an execution
-   * POST /api/agents/cancel
+   * Get available pipelines
+   * GET /api/orchestration/pipelines
    */
-  app.post('/api/agents/cancel', (req, res) => {
-    const { taskId } = req.body;
+  app.get('/api/orchestration/pipelines', (req, res) => {
+    const pipelines = orchestrator.getAllPipelines();
+    res.json(pipelines.map(p => ({
+      name: p.name,
+      description: p.description,
+      phases: p.phases.map(ph => ({
+        name: ph.name,
+        description: ph.description,
+        agentType: ph.agentType,
+      })),
+    })));
+  });
 
-    if (!taskId) {
-      return res.status(400).json({ error: 'Missing taskId' });
+  /**
+   * Abort a running session
+   * POST /api/orchestration/abort
+   */
+  app.post('/api/orchestration/abort', async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+
+      if (!sessionId) {
+        return res.status(400).json({ error: 'Missing sessionId' });
+      }
+
+      await openCodeClient.abortSession(sessionId);
+      res.json({ success: true, message: `Aborted session ${sessionId}` });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-
-    agentExecutor.cancel(taskId);
-    res.json({ success: true, message: `Cancelled execution for task ${taskId}` });
   });
 
   /**
@@ -256,7 +278,7 @@ async function main() {
    */
   app.get('/api/tasks/:taskId/history', (req, res) => {
     const { taskId } = req.params;
-    const history = agentExecutor.getHistory(taskId);
+    const history = executionTracker.getExecutionHistory(taskId);
     res.json(history);
   });
 
@@ -266,8 +288,18 @@ async function main() {
    */
   app.get('/api/tasks/:taskId/stats', (req, res) => {
     const { taskId } = req.params;
-    const stats = agentExecutor.getStats(taskId);
+    const stats = executionTracker.getStats(taskId);
     res.json(stats);
+  });
+
+  /**
+   * Get security vulnerabilities for a task
+   * GET /api/tasks/:taskId/vulnerabilities
+   */
+  app.get('/api/tasks/:taskId/vulnerabilities', (req, res) => {
+    const { taskId } = req.params;
+    const summary = agentSpy.getSummary(taskId);
+    res.json(summary);
   });
 
   // ===========================================
@@ -330,16 +362,66 @@ async function main() {
   });
 
   // ===========================================
-  // Provider Endpoints
+  // OpenCode Endpoints
   // ===========================================
 
   /**
-   * Get provider health
-   * GET /api/providers/health
+   * Get OpenCode status
+   * GET /api/opencode/status
    */
-  app.get('/api/providers/health', async (req, res) => {
-    const health = await providerFactory.healthCheckAll();
-    res.json(health);
+  app.get('/api/opencode/status', async (req, res) => {
+    try {
+      if (!openCodeClient.isConnected()) {
+        return res.json({ connected: false });
+      }
+
+      const client = openCodeClient.getClient();
+      const agents = await openCodeClient.getAgents();
+      const providers = await openCodeClient.getProviders();
+
+      res.json({
+        connected: true,
+        agents,
+        providers,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ===========================================
+  // Sentinental Core Endpoints (ML Training)
+  // ===========================================
+
+  /**
+   * Get Sentinental webhook status
+   * GET /api/sentinental/status
+   */
+  app.get('/api/sentinental/status', (req, res) => {
+    res.json(sentinentalWebhook.getStatus());
+  });
+
+  /**
+   * Configure Sentinental webhook
+   * POST /api/sentinental/configure
+   */
+  app.post('/api/sentinental/configure', (req, res) => {
+    const { url, apiKey, batchSize, flushIntervalMs, enabled, minSeverity } = req.body;
+    sentinentalWebhook.configure({ url, apiKey, batchSize, flushIntervalMs, enabled, minSeverity });
+    res.json({ success: true, status: sentinentalWebhook.getStatus() });
+  });
+
+  /**
+   * Manually flush buffered data to Sentinental
+   * POST /api/sentinental/flush
+   */
+  app.post('/api/sentinental/flush', async (req, res) => {
+    try {
+      await sentinentalWebhook.flush();
+      res.json({ success: true, status: sentinentalWebhook.getStatus() });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   // ===========================================
@@ -379,20 +461,26 @@ async function main() {
     console.log('   PUT  /api/tasks/:id           - Update task');
     console.log('   DELETE /api/tasks/:id         - Delete task');
     console.log(' ');
-    console.log(' Agent Endpoints:');
-    console.log('   POST /api/agents/execute      - Execute agent');
-    console.log('   POST /api/agents/cancel       - Cancel execution');
+    console.log(' Orchestration Endpoints (OpenCode-powered):');
+    console.log('   POST /api/orchestration/run   - Run pipeline');
+    console.log('   GET  /api/orchestration/pipelines - List pipelines');
+    console.log('   POST /api/orchestration/abort - Abort session');
     console.log('   GET  /api/tasks/:id/history   - Execution history');
     console.log('   GET  /api/tasks/:id/stats     - Execution stats');
+    console.log('   GET  /api/tasks/:id/vulnerabilities - Security report');
     console.log(' ');
     console.log(' Training Endpoints:');
     console.log('   GET  /api/training/export/:id - Export task data');
     console.log('   GET  /api/training/export-jsonl - Export JSONL');
     console.log('   GET  /api/training/stats      - Export stats');
     console.log(' ');
+    console.log(' Sentinental Core (ML Training on DGX Spark):');
+    console.log('   GET  /api/sentinental/status  - Webhook status');
+    console.log('   POST /api/sentinental/configure - Configure webhook');
+    console.log('   POST /api/sentinental/flush   - Flush buffered data');
+    console.log(' ');
     console.log(' Other:');
-    console.log('   GET  /api/tools               - Available tools');
-    console.log('   GET  /api/providers/health    - Provider health');
+    console.log('   GET  /api/opencode/status     - OpenCode status');
     console.log('   GET  /health                  - Server health');
     console.log('='.repeat(60));
   });
@@ -400,14 +488,16 @@ async function main() {
   // Graceful shutdown
   process.on('SIGINT', async () => {
     console.log('\n[Server] Shutting down...');
-    await providerFactory.disposeAll();
+    await sentinentalWebhook.shutdown();
+    openCodeClient.disconnect();
     closeDatabase();
     process.exit(0);
   });
 
   process.on('SIGTERM', async () => {
     console.log('\n[Server] Shutting down...');
-    await providerFactory.disposeAll();
+    await sentinentalWebhook.shutdown();
+    openCodeClient.disconnect();
     closeDatabase();
     process.exit(0);
   });

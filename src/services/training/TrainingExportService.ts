@@ -3,11 +3,14 @@
  *
  * Exports granular execution data in clean JSON/JSONL format
  * ready for ML training on NVIDIA DGX Spark.
+ *
+ * v2.1.0: Added ML security signals for behavioral training
  */
 
 import { AgentExecutionRepository, IAgentExecution } from '../../database/repositories/AgentExecutionRepository.js';
 import { AgentTurnRepository, IAgentTurn } from '../../database/repositories/AgentTurnRepository.js';
 import { ToolCallRepository, IToolCall } from '../../database/repositories/ToolCallRepository.js';
+import { mlSecurityAnalyzer } from './MLSecurityAnalyzer.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -74,6 +77,33 @@ export interface TrainingDataRecord {
     durationMs?: number;
     callOrder: number;
   }>;
+
+  // ML Security Signals (v2.1.0)
+  mlSecuritySignals?: {
+    signals: Array<{
+      id: string;
+      signalType: string;
+      severity: string;
+      description: string;
+      details: Record<string, any>;
+      detectedAt: string;
+    }>;
+    summary: {
+      total: number;
+      bySeverity: Record<string, number>;
+      byType: Record<string, number>;
+    };
+    promptClassification?: {
+      primaryType: string;
+      confidence: number;
+    };
+    gitContext?: {
+      branch: string;
+      isDirty: boolean;
+      recentCommits: string[];
+    };
+    toolSequences?: string[][];
+  };
 }
 
 export interface ExportOptions {
@@ -85,7 +115,7 @@ export interface ExportOptions {
 }
 
 class TrainingExportServiceClass {
-  private readonly VERSION = '2.0.0';
+  private readonly VERSION = '2.1.0'; // Added ML security signals
 
   /**
    * Export training data for a single task
@@ -97,6 +127,9 @@ class TrainingExportServiceClass {
 
     const summary = this.calculateSummary(executions, turns, toolCalls);
 
+    // Get ML security signals
+    const mlSignalsData = this.getMLSecuritySignals(taskId, executions);
+
     return {
       id: this.generateExportId(),
       taskId,
@@ -106,7 +139,64 @@ class TrainingExportServiceClass {
       executions: executions.map(e => this.mapExecution(e)),
       turns: turns.map(t => this.mapTurn(t)),
       toolCalls: toolCalls.map(tc => this.mapToolCall(tc)),
+      mlSecuritySignals: mlSignalsData,
     };
+  }
+
+  /**
+   * Get ML security signals for a task
+   */
+  private getMLSecuritySignals(taskId: string, executions: IAgentExecution[]): TrainingDataRecord['mlSecuritySignals'] {
+    try {
+      const signals = mlSecurityAnalyzer.getSignalsForTask(taskId);
+      const summary = mlSecurityAnalyzer.getSignalSummary(taskId);
+
+      // Extract prompt classification
+      const promptSignal = signals.find(s => s.signalType === 'prompt_classification');
+      const promptClassification = promptSignal?.details
+        ? {
+            primaryType: promptSignal.details.primaryType as string,
+            confidence: promptSignal.details.confidence as number,
+          }
+        : undefined;
+
+      // Extract git context
+      const gitSignal = signals.find(s => s.signalType === 'git_context');
+      const gitContext = gitSignal?.details
+        ? {
+            branch: gitSignal.details.branch as string,
+            isDirty: gitSignal.details.isDirty as boolean,
+            recentCommits: gitSignal.details.recentCommits as string[],
+          }
+        : undefined;
+
+      // Get tool sequences
+      const toolSequences = executions
+        .map(e => mlSecurityAnalyzer.getToolSequence(e.id))
+        .filter(seq => seq.length > 0);
+
+      return {
+        signals: signals.map(s => ({
+          id: s.id,
+          signalType: s.signalType,
+          severity: s.severity,
+          description: s.description,
+          details: s.details,
+          detectedAt: s.detectedAt.toISOString(),
+        })),
+        summary: {
+          total: summary.total,
+          bySeverity: summary.bySeverity,
+          byType: summary.byType,
+        },
+        promptClassification,
+        gitContext,
+        toolSequences: toolSequences.length > 0 ? toolSequences : undefined,
+      };
+    } catch (error: any) {
+      console.warn(`[TrainingExport] ML signals error: ${error.message}`);
+      return undefined;
+    }
   }
 
   /**

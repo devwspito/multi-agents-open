@@ -2,10 +2,11 @@
  * Development Phase
  *
  * Implements the changes required by the task.
+ *
+ * Uses OpenCode SDK for agent execution.
  */
 
-import { BasePhase, PhaseContext, PhaseResult } from '../Phase.js';
-import { AgentExecutionResponse } from '../../types/index.js';
+import { BasePhase, PhaseContext, PhaseResult, OpenCodeExecutionResult } from '../Phase.js';
 
 export class DevelopmentPhase extends BasePhase {
   readonly name = 'Development';
@@ -76,11 +77,11 @@ Guidelines:
 - Be thorough but efficient`;
   }
 
-  async processOutput(output: AgentExecutionResponse, context: PhaseContext): Promise<PhaseResult> {
+  async processOutput(result: OpenCodeExecutionResult, context: PhaseContext): Promise<PhaseResult> {
     // Track which files were modified
-    const filesModified = output.toolCalls
+    const filesModified = result.toolCalls
       .filter(tc => tc.toolName === 'Edit' || tc.toolName === 'Write')
-      .map(tc => tc.toolInput.file_path)
+      .map(tc => tc.toolInput?.file_path)
       .filter(Boolean);
 
     context.variables.set('filesModified', filesModified);
@@ -88,13 +89,14 @@ Guidelines:
     return {
       success: true,
       output: {
-        summary: output.finalOutput,
+        summary: result.finalOutput,
         filesModified,
-        toolCalls: output.toolCalls.length,
+        toolCalls: result.toolCalls.length,
       },
       metadata: {
-        turns: output.turns,
-        tokens: output.usage.totalTokens,
+        sessionId: result.sessionId,
+        turns: result.turns,
+        vulnerabilities: result.vulnerabilities.length,
       },
     };
   }

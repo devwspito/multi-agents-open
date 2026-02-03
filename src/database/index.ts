@@ -129,6 +129,28 @@ export function initializeDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_toolcalls_task ON tool_calls(task_id);
   `);
 
+  // ML Security Signals - behavioral data for ML training
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ml_security_signals (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      execution_id TEXT,
+      signal_type TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      description TEXT NOT NULL,
+      details TEXT DEFAULT '{}',
+      detected_at TEXT NOT NULL,
+      FOREIGN KEY (task_id) REFERENCES tasks(id),
+      FOREIGN KEY (execution_id) REFERENCES agent_executions(id)
+    )
+  `);
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_ml_signals_task ON ml_security_signals(task_id);
+    CREATE INDEX IF NOT EXISTS idx_ml_signals_execution ON ml_security_signals(execution_id);
+    CREATE INDEX IF NOT EXISTS idx_ml_signals_type ON ml_security_signals(signal_type);
+  `);
+
   console.log('[Database] SQLite initialized successfully');
 }
 

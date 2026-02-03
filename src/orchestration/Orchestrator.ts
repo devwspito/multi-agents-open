@@ -3,11 +3,13 @@
  *
  * Coordinates the execution of multiple phases in sequence.
  * Routes tasks through the appropriate pipeline.
+ * Automatically pushes completed data to Sentinental Core for ML training.
  */
 
-import { IPhase, PhaseContext, PhaseResult } from './Phase.js';
+import { IPhase, PhaseContext, PhaseResult, cleanupTaskTracking } from './Phase.js';
 import { Task, TaskStatus } from '../types/index.js';
 import { TaskRepository } from '../database/repositories/TaskRepository.js';
+import { sentinentalWebhook } from '../services/training/index.js';
 
 /**
  * Pipeline definition
@@ -152,6 +154,14 @@ class OrchestratorClass {
 
     const duration = Date.now() - startTime;
     console.log(`\n[Orchestrator] Pipeline ${pipelineName} ${success ? 'completed' : 'failed'} in ${duration}ms`);
+
+    // Push to Sentinental Core for ML training
+    sentinentalWebhook.push(taskId).catch(err => {
+      console.warn(`[Orchestrator] Failed to push to Sentinental: ${err.message}`);
+    });
+
+    // Cleanup task tracking state to prevent memory leaks
+    cleanupTaskTracking(taskId);
 
     return {
       success,
