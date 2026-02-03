@@ -2,9 +2,14 @@
  * Orchestration Exports
  */
 
-export { IPhase, BasePhase, PhaseResult, PhaseContext, PhaseConfig } from './Phase.js';
-export { orchestrator, Pipeline, OrchestrationResult, ApprovalMode } from './Orchestrator.js';
+export { BasePhase } from './Phase.js';
+export type { IPhase, PhaseResult, PhaseContext, PhaseConfig } from './Phase.js';
+
+export { orchestrator } from './Orchestrator.js';
+export type { Pipeline, OrchestrationResult, ApprovalMode } from './Orchestrator.js';
+
 export { AnalysisPhase, DevelopmentPhase, JudgePhase, FixerPhase } from './phases/index.js';
+export type { JudgeVerdict, JudgeOutput } from './phases/index.js';
 
 // Create and register default pipelines
 import { orchestrator } from './Orchestrator.js';

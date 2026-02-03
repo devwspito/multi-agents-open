@@ -2,21 +2,24 @@
  * Training Exports
  */
 
-export { trainingExportService, TrainingDataRecord, ExportOptions } from './TrainingExportService.js';
+export { trainingExportService } from './TrainingExportService.js';
+export type { TrainingDataRecord, ExportOptions } from './TrainingExportService.js';
+
 export { executionTracker } from './ExecutionTracker.js';
-export {
-  sentinentalWebhook,
+
+export { sentinentalWebhook } from './SentinentalWebhook.js';
+export type {
   SentinentalConfig,
   SecurityTrainingRecord,
   ExecutionContext,
-  // PLATINO TRACE interfaces
   ProjectContext,
   CodeContext,
   CVSSLike,
   TaskHistory,
 } from './SentinentalWebhook.js';
-export {
-  mlSecurityAnalyzer,
+
+export { mlSecurityAnalyzer } from './MLSecurityAnalyzer.js';
+export type {
   SignalType,
   SignalSeverity,
   PromptType,

@@ -10,7 +10,7 @@ import { getProject } from './projects.js';
 import { getRepository } from './repositories.js';
 import { TaskRepository } from '../../database/repositories/TaskRepository.js';
 import { orchestrator, ApprovalMode } from '../../orchestration/index.js';
-import { openCodeClient } from '../../services/opencode/OpenCodeClient.js';
+import { openCodeClient, openCodeEventBridge } from '../../services/opencode/index.js';
 import { socketService, approvalService } from '../../services/realtime/index.js';
 import { WorkspaceService } from '../../services/workspace/index.js';
 import { v4 as uuid } from 'uuid';
@@ -176,6 +176,9 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
   };
   executions.set(task.id, execution);
 
+  // Register session with event bridge for real-time activity forwarding
+  openCodeEventBridge.registerSession(task.id, sessionId);
+
   // Update task status
   TaskRepository.updateStatus(task.id, 'running');
 
@@ -207,20 +210,26 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
     execution.status = result.success ? 'completed' : 'failed';
     TaskRepository.updateStatus(task.id, result.success ? 'completed' : 'failed');
     socketService.toTask(task.id, 'task:complete', { taskId: task.id, result });
+    // Unregister from event bridge
+    openCodeEventBridge.unregisterSession(sessionId);
   }).catch(error => {
     execution.status = 'failed';
     TaskRepository.updateStatus(task.id, 'failed');
     socketService.toTask(task.id, 'task:error', { taskId: task.id, error: error.message });
+    // Unregister from event bridge
+    openCodeEventBridge.unregisterSession(sessionId);
   });
 
   res.json({ data: { taskId: task.id, sessionId, status: 'running' } });
 });
 
 /**
- * POST /api/tasks/:taskId/pause
- * Pause task execution
+ * POST /api/tasks/:taskId/interrupt
+ * Interrupt (abort) task execution - session persists for later continuation
+ *
+ * OpenCode SDK: session.abort()
  */
-router.post('/:taskId/pause', async (req: Request, res: Response) => {
+router.post('/:taskId/interrupt', async (req: Request, res: Response) => {
   const execution = executions.get(req.params.taskId);
   if (!execution) {
     return res.status(404).json({ error: 'No running execution' });
@@ -230,43 +239,45 @@ router.post('/:taskId/pause', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Task not running' });
   }
 
-  // Pause OpenCode session
-  await openCodeClient.pauseSession(execution.sessionId);
+  // Interrupt OpenCode session (abort but keep session for later)
+  await openCodeClient.abortSession(execution.sessionId);
 
   execution.status = 'paused';
   execution.pausedAt = new Date();
 
   TaskRepository.updateStatus(req.params.taskId, 'paused');
-  socketService.toTask(req.params.taskId, 'task:paused', { taskId: req.params.taskId });
+  socketService.toTask(req.params.taskId, 'task:interrupted', { taskId: req.params.taskId });
 
-  res.json({ data: { status: 'paused', pausedAt: execution.pausedAt } });
+  res.json({ data: { status: 'interrupted', pausedAt: execution.pausedAt } });
 });
 
 /**
- * POST /api/tasks/:taskId/resume
- * Resume paused task
+ * POST /api/tasks/:taskId/continue
+ * Continue an interrupted task with a new prompt
+ *
+ * OpenCode SDK: session.prompt() to existing session
  */
-router.post('/:taskId/resume', async (req: Request, res: Response) => {
+router.post('/:taskId/continue', async (req: Request, res: Response) => {
   const execution = executions.get(req.params.taskId);
   if (!execution) {
     return res.status(404).json({ error: 'No execution found' });
   }
 
   if (execution.status !== 'paused') {
-    return res.status(400).json({ error: 'Task not paused' });
+    return res.status(400).json({ error: 'Task not interrupted' });
   }
 
   const { prompt } = req.body;
-  const resumePrompt = prompt || 'Continue with the task from where you left off.';
+  const continuePrompt = prompt || 'Continue with the task from where you left off.';
 
-  // Resume OpenCode session
-  await openCodeClient.resumeSession(execution.sessionId, resumePrompt);
+  // Continue OpenCode session with new prompt
+  await openCodeClient.sendPrompt(execution.sessionId, continuePrompt);
 
   execution.status = 'running';
   execution.pausedAt = undefined;
 
   TaskRepository.updateStatus(req.params.taskId, 'running');
-  socketService.toTask(req.params.taskId, 'task:resumed', { taskId: req.params.taskId });
+  socketService.toTask(req.params.taskId, 'task:continued', { taskId: req.params.taskId });
 
   res.json({ data: { status: 'running' } });
 });
@@ -280,6 +291,9 @@ router.post('/:taskId/cancel', async (req: Request, res: Response) => {
   if (!execution) {
     return res.status(404).json({ error: 'No execution found' });
   }
+
+  // Unregister from event bridge first
+  openCodeEventBridge.unregisterSession(execution.sessionId);
 
   // Abort and delete OpenCode session
   await openCodeClient.abortSession(execution.sessionId);
@@ -297,7 +311,9 @@ router.post('/:taskId/cancel', async (req: Request, res: Response) => {
 
 /**
  * POST /api/tasks/:taskId/retry
- * Retry failed task or current phase
+ * Retry a failed/interrupted task - alias for continue with retry prompt
+ *
+ * OpenCode SDK: session.prompt() to existing session
  */
 router.post('/:taskId/retry', async (req: Request, res: Response) => {
   const execution = executions.get(req.params.taskId);
@@ -306,11 +322,13 @@ router.post('/:taskId/retry', async (req: Request, res: Response) => {
   }
 
   const { prompt } = req.body;
+  const retryPrompt = prompt || 'Please try again with the previous task.';
 
-  // Retry OpenCode session
-  await openCodeClient.retrySession(execution.sessionId, { newPrompt: prompt });
+  // Retry = continue with new prompt
+  await openCodeClient.sendPrompt(execution.sessionId, retryPrompt);
 
   execution.status = 'running';
+  execution.pausedAt = undefined;
 
   TaskRepository.updateStatus(req.params.taskId, 'running');
   socketService.toTask(req.params.taskId, 'task:retrying', { taskId: req.params.taskId });
