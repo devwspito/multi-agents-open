@@ -45,15 +45,15 @@ services:
       - multiagents-net
     restart: unless-stopped
 
-  # Frontend (production build served by nginx, or dev mode)
+  # Frontend (production build)
   frontend:
     build:
-      context: ${FRONTEND_PATH:-../../multi-agent-frontend}
-      dockerfile: Dockerfile
+      context: ${FRONTEND_PATH:-../../mult-agents-frontend}
+      dockerfile: ../open-multi-agents/deploy/Dockerfile.frontend
+      args:
+        - VITE_API_URL=https://multiagent.duckdns.org
+        - VITE_WS_URL=wss://multiagent.duckdns.org
     container_name: multiagents-frontend
-    environment:
-      - VITE_API_URL=https://multiagent.duckdns.org
-      - VITE_WS_URL=wss://multiagent.duckdns.org
     networks:
       - multiagents-net
     restart: unless-stopped

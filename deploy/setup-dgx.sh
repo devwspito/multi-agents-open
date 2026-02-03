@@ -86,6 +86,16 @@ else
     echo ".env already exists"
 fi
 
+# 6. Clone frontend if not exists
+echo "[6/6] Cloning frontend..."
+if [ ! -d "../../mult-agents-frontend" ]; then
+    git clone https://github.com/devwspito/mult-agents-frontend.git ../../mult-agents-frontend
+    echo "Frontend cloned"
+else
+    echo "Frontend already exists, pulling latest..."
+    cd ../../mult-agents-frontend && git pull && cd -
+fi
+
 echo ""
 echo "=========================================="
 echo "  Setup Complete!"
@@ -93,7 +103,6 @@ echo "=========================================="
 echo ""
 echo "Next steps:"
 echo "  1. Edit .env and add your ANTHROPIC_API_KEY"
-echo "  2. Clone the frontend repo next to this project"
-echo "  3. Run: docker-compose up -d"
+echo "  2. Run: docker-compose up -d"
 echo ""
 echo "Your app will be available at: https://$DOMAIN"
