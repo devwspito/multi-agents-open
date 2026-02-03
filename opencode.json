@@ -1,39 +1,43 @@
 {
-  "$schema": "https://opencode.ai/schema/opencode.json",
-  "providers": {
+  "$schema": "https://opencode.ai/config.json",
+  "permission": "allow",
+  "provider": {
     "dgx-spark": {
-      "type": "@ai-sdk/openai-compatible",
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DGX Spark (Local)",
       "options": {
-        "baseURL": "${OPENCODE_DGX_URL:-http://localhost:8080/v1}",
-        "name": "DGX Spark"
+        "baseURL": "http://localhost:8080/v1"
       },
       "models": {
+        "glm-4.7": {
+          "name": "GLM 4.7 (Primary - 131K context, SWE-bench 73.8%)"
+        },
         "llama-3.3-70b": {
-          "id": "llama-3.3-70b-instruct"
+          "name": "Llama 3.3 70B Instruct"
         },
         "llama-3.1-8b": {
-          "id": "llama-3.1-8b-instruct"
+          "name": "Llama 3.1 8B Instruct"
         },
         "deepseek-r1": {
-          "id": "deepseek-r1"
+          "name": "DeepSeek R1"
         }
       }
     },
     "ollama": {
-      "type": "@ai-sdk/openai-compatible",
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (Local)",
       "options": {
-        "baseURL": "${OPENCODE_OLLAMA_URL:-http://localhost:11434/v1}",
-        "name": "Ollama"
+        "baseURL": "http://localhost:11434/v1"
       },
       "models": {
         "qwen-coder": {
-          "id": "qwen2.5-coder:32b"
+          "name": "Qwen 2.5 Coder 32B"
         },
         "llama3": {
-          "id": "llama3.2:latest"
+          "name": "Llama 3.2"
         },
         "codellama": {
-          "id": "codellama:34b"
+          "name": "Code Llama 34B"
         }
       }
     }
@@ -41,19 +45,19 @@
   "agents": {
     "analyst": {
       "name": "Code Analyst",
-      "model": "dgx-spark/llama-3.3-70b",
+      "model": "dgx-spark/glm-4.7",
       "systemPrompt": "You are a code analyst agent. Analyze tasks and codebases thoroughly.",
       "tools": ["read", "glob", "grep"]
     },
     "developer": {
       "name": "Developer",
-      "model": "dgx-spark/llama-3.3-70b",
+      "model": "dgx-spark/glm-4.7",
       "systemPrompt": "You are a senior software developer agent. Implement code changes efficiently.",
       "tools": ["read", "write", "edit", "bash", "glob", "grep"]
     },
     "reviewer": {
       "name": "Code Reviewer",
-      "model": "dgx-spark/llama-3.3-70b",
+      "model": "dgx-spark/glm-4.7",
       "systemPrompt": "You are a code reviewer. Review changes for quality, security, and best practices.",
       "tools": ["read", "glob", "grep"]
     }

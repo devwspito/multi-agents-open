@@ -11,6 +11,7 @@
 export type TaskStatus =
   | 'pending'
   | 'running'
+  | 'paused'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -21,6 +22,7 @@ export type TaskStatus =
 export interface Task {
   id: string;
   projectId?: string;
+  repositoryId?: string;
   title: string;
   description?: string;
   status: TaskStatus;

@@ -39,6 +39,7 @@ export function initializeDatabase(): void {
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       project_id TEXT,
+      repository_id TEXT,
       title TEXT NOT NULL,
       description TEXT,
       status TEXT DEFAULT 'pending',

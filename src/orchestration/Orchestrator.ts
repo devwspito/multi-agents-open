@@ -10,6 +10,9 @@ import { IPhase, PhaseContext, PhaseResult, cleanupTaskTracking } from './Phase.
 import { Task, TaskStatus } from '../types/index.js';
 import { TaskRepository } from '../database/repositories/TaskRepository.js';
 import { sentinentalWebhook } from '../services/training/index.js';
+import { socketService, approvalService } from '../services/realtime/index.js';
+
+export type ApprovalMode = 'manual' | 'automatic';
 
 /**
  * Pipeline definition
@@ -66,10 +69,12 @@ class OrchestratorClass {
     options: {
       projectPath?: string;
       variables?: Record<string, any>;
+      approvalMode?: ApprovalMode;
       onPhaseStart?: (phaseName: string) => void;
       onPhaseComplete?: (phaseName: string, result: PhaseResult) => void;
     } = {}
   ): Promise<OrchestrationResult> {
+    const approvalMode = options.approvalMode || 'automatic';
     const startTime = Date.now();
 
     // Get task
@@ -118,6 +123,12 @@ class OrchestratorClass {
       console.log(`\n[Orchestrator] Starting phase: ${phase.name}`);
       options.onPhaseStart?.(phase.name);
 
+      // Stream phase start to frontend
+      socketService.toTask(taskId, 'phase:start', {
+        phase: phase.name,
+        description: phase.description,
+      });
+
       try {
         const result = await phase.execute(context);
         phaseResults.set(phase.name, result);
@@ -125,11 +136,32 @@ class OrchestratorClass {
 
         options.onPhaseComplete?.(phase.name, result);
 
+        // Stream phase result to frontend
+        socketService.toTask(taskId, 'phase:complete', {
+          phase: phase.name,
+          success: result.success,
+          output: result.output,
+          metadata: result.metadata,
+        });
+
         if (!result.success) {
           console.log(`[Orchestrator] Phase ${phase.name} failed: ${result.error}`);
           lastError = result.error;
           success = false;
           break;
+        }
+
+        // Manual approval: wait for user before continuing
+        if (approvalMode === 'manual') {
+          console.log(`[Orchestrator] Waiting for approval on ${phase.name}...`);
+          const approved = await approvalService.requestApproval(taskId, phase.name, result.output);
+          if (!approved) {
+            console.log(`[Orchestrator] Phase ${phase.name} rejected by user`);
+            lastError = 'User rejected phase output';
+            success = false;
+            break;
+          }
+          console.log(`[Orchestrator] Phase ${phase.name} approved by user`);
         }
 
         console.log(`[Orchestrator] Phase ${phase.name} completed successfully`);

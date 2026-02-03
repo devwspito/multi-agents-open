@@ -9,8 +9,10 @@ import { Task, TaskStatus } from '../../types/index.js';
 
 export interface CreateTaskParams {
   projectId?: string;
+  repositoryId?: string;
   title: string;
   description?: string;
+  status?: TaskStatus;
 }
 
 export interface UpdateTaskParams {
@@ -26,20 +28,22 @@ export class TaskRepository {
   static create(params: CreateTaskParams): Task {
     const id = generateId();
     const now = new Date().toISOString();
+    const status = params.status || 'pending';
 
     const stmt = db.prepare(`
-      INSERT INTO tasks (id, project_id, title, description, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'pending', ?, ?)
+      INSERT INTO tasks (id, project_id, repository_id, title, description, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    stmt.run(id, params.projectId, params.title, params.description, now, now);
+    stmt.run(id, params.projectId, params.repositoryId, params.title, params.description, status, now, now);
 
     return {
       id,
       projectId: params.projectId,
+      repositoryId: params.repositoryId,
       title: params.title,
       description: params.description,
-      status: 'pending',
+      status,
       createdAt: new Date(now),
       updatedAt: new Date(now),
     };
@@ -183,6 +187,7 @@ export class TaskRepository {
     return {
       id: row.id,
       projectId: row.project_id,
+      repositoryId: row.repository_id,
       title: row.title,
       description: row.description,
       status: row.status,

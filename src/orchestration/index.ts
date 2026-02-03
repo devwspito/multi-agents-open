@@ -3,13 +3,15 @@
  */
 
 export { IPhase, BasePhase, PhaseResult, PhaseContext, PhaseConfig } from './Phase.js';
-export { orchestrator, Pipeline, OrchestrationResult } from './Orchestrator.js';
-export { AnalysisPhase, DevelopmentPhase } from './phases/index.js';
+export { orchestrator, Pipeline, OrchestrationResult, ApprovalMode } from './Orchestrator.js';
+export { AnalysisPhase, DevelopmentPhase, JudgePhase, FixerPhase } from './phases/index.js';
 
 // Create and register default pipelines
 import { orchestrator } from './Orchestrator.js';
 import { AnalysisPhase } from './phases/AnalysisPhase.js';
 import { DevelopmentPhase } from './phases/DevelopmentPhase.js';
+import { JudgePhase } from './phases/JudgePhase.js';
+import { FixerPhase } from './phases/FixerPhase.js';
 
 /**
  * Initialize default pipelines
@@ -31,6 +33,18 @@ export function initializePipelines(): void {
     description: 'Analysis only pipeline',
     phases: [
       new AnalysisPhase(),
+    ],
+  });
+
+  // Full pipeline with review
+  orchestrator.registerPipeline({
+    name: 'full',
+    description: 'Full pipeline: Analysis → Development → Judge → Fixer',
+    phases: [
+      new AnalysisPhase(),
+      new DevelopmentPhase(),
+      new JudgePhase(),
+      new FixerPhase(),
     ],
   });
 

@@ -18,7 +18,7 @@ export {
 export {
   mlSecurityAnalyzer,
   SignalType,
-  Severity,
+  SignalSeverity,
   PromptType,
   IMLSecuritySignal,
 } from './MLSecurityAnalyzer.js';

@@ -3,6 +3,9 @@
  *
  * Manages connection to OpenCode server and provides
  * methods for session management and event handling.
+ *
+ * KEY FEATURE: Sessions persist in OpenCode's SQLite database.
+ * This allows pause/resume/retry without losing context.
  */
 
 import { createOpencodeClient } from '@opencode-ai/sdk/v2';
@@ -26,6 +29,16 @@ export interface OpenCodeEvent {
   type: string;
   properties: Record<string, any>;
 }
+
+export interface SessionInfo {
+  id: string;
+  title?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  messageCount?: number;
+}
+
+export type SessionStatus = 'idle' | 'running' | 'paused' | 'error';
 
 class OpenCodeClientService {
   private client: ReturnType<typeof createOpencodeClient> | null = null;
@@ -229,6 +242,112 @@ class OpenCodeClientService {
     this.client = null;
     this.connected = false;
     console.log('[OpenCode] Disconnected');
+  }
+
+  // ============================================
+  // SESSION PERSISTENCE & CONTROL
+  // Sessions persist in OpenCode's SQLite DB
+  // ============================================
+
+  /**
+   * List all sessions (persisted in OpenCode)
+   */
+  async listSessions(): Promise<SessionInfo[]> {
+    const client = this.getClient();
+    const result = await client.session.list({
+      directory: this.config.directory,
+    });
+    return (result.data || []) as SessionInfo[];
+  }
+
+  /**
+   * Pause a running session (abort but keep state)
+   * Session can be resumed later with resumeSession()
+   */
+  async pauseSession(sessionId: string): Promise<void> {
+    await this.abortSession(sessionId);
+    console.log(`[OpenCode] Session ${sessionId} paused (can resume later)`);
+  }
+
+  /**
+   * Resume a paused/existing session with a new prompt
+   * This continues the conversation from where it left off
+   */
+  async resumeSession(sessionId: string, prompt: string, options?: {
+    model?: { providerID: string; modelID: string };
+    system?: string;
+  }): Promise<void> {
+    const client = this.getClient();
+
+    // Verify session exists
+    const session = await this.getSession(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    // Send prompt to existing session (continues conversation)
+    await client.session.prompt({
+      sessionID: sessionId,
+      directory: this.config.directory,
+      parts: [{ type: 'text', text: prompt }],
+      ...(options?.model && { model: options.model }),
+      ...(options?.system && { system: options.system }),
+    });
+
+    console.log(`[OpenCode] Resumed session ${sessionId}`);
+  }
+
+  /**
+   * Retry a session - useful after errors or rejections
+   * Can optionally provide a different prompt
+   */
+  async retrySession(sessionId: string, options?: {
+    newPrompt?: string;
+    model?: { providerID: string; modelID: string };
+  }): Promise<void> {
+    const prompt = options?.newPrompt || 'Please try again with the previous task.';
+    await this.resumeSession(sessionId, prompt, { model: options?.model });
+    console.log(`[OpenCode] Retrying session ${sessionId}`);
+  }
+
+  /**
+   * Continue session and wait for completion
+   * Combines resumeSession + waitForIdle
+   */
+  async continueAndWait(sessionId: string, prompt: string, options?: {
+    model?: { providerID: string; modelID: string };
+    timeout?: number;
+    onEvent?: (event: OpenCodeEvent) => void;
+  }): Promise<OpenCodeEvent[]> {
+    await this.resumeSession(sessionId, prompt, { model: options?.model });
+    return this.waitForIdle(sessionId, {
+      timeout: options?.timeout,
+      onEvent: options?.onEvent,
+    });
+  }
+
+  /**
+   * Check if a session exists and get its info
+   */
+  async sessionExists(sessionId: string): Promise<boolean> {
+    try {
+      const session = await this.getSession(sessionId);
+      return !!session;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Delete a session permanently
+   */
+  async deleteSession(sessionId: string): Promise<void> {
+    const client = this.getClient();
+    await client.session.delete({
+      sessionID: sessionId,
+      directory: this.config.directory,
+    });
+    console.log(`[OpenCode] Deleted session ${sessionId}`);
   }
 }
 
