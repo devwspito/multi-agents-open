@@ -9,10 +9,12 @@ import { authMiddleware, getUserGitHubToken } from './auth.js';
 import { getProject } from './projects.js';
 import { getRepository } from './repositories.js';
 import { TaskRepository } from '../../database/repositories/TaskRepository.js';
+import { RepositoryRepository } from '../../database/repositories/RepositoryRepository.js';
 import { orchestrator, ApprovalMode } from '../../orchestration/index.js';
 import { openCodeClient, openCodeEventBridge } from '../../services/opencode/index.js';
 import { socketService, approvalService } from '../../services/realtime/index.js';
 import { WorkspaceService } from '../../services/workspace/index.js';
+import { RepositoryInfo } from '../../types/index.js';
 import { v4 as uuid } from 'uuid';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -74,6 +76,7 @@ router.post('/', (req: Request, res: Response) => {
   }
 
   const task = TaskRepository.create({
+    userId,
     title,
     description,
     projectId,
@@ -125,22 +128,34 @@ router.delete('/:taskId', (req: Request, res: Response) => {
 /**
  * POST /api/tasks/:taskId/start
  * Start task orchestration
+ *
+ * Body: { prompt: string } - The user's message describing the task
  */
 router.post('/:taskId/start', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
-  const task = TaskRepository.findById(req.params.taskId);
+  const { prompt } = req.body;
+
+  // Require prompt from user
+  if (!prompt || prompt.trim().length < 5) {
+    return res.status(400).json({
+      error: 'prompt required - describe what you want the AI to do'
+    });
+  }
+
+  let task = TaskRepository.findById(req.params.taskId);
 
   if (!task) {
     return res.status(404).json({ error: 'Task not found' });
   }
+
+  // Save the user's prompt as the task description
+  task = TaskRepository.update(task.id, { description: prompt.trim() })!;
 
   const project = getProject(task.projectId!);
   if (!project) {
     return res.status(404).json({ error: 'Project not found' });
   }
 
-  // Get repository info
-  const repo = task.repositoryId ? getRepository(task.repositoryId) : null;
   const githubToken = getUserGitHubToken(userId);
 
   // Create workspace directory
@@ -149,11 +164,54 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
     fs.mkdirSync(workspacePath, { recursive: true });
   }
 
-  // Clone repository if specified
-  if (repo && githubToken) {
-    const repoDir = path.join(workspacePath, repo.name);
-    if (!fs.existsSync(repoDir)) {
-      await WorkspaceService.cloneWithToken(repo.cloneUrl, repoDir, githubToken);
+  // Get ALL repositories for this project
+  const allRepos = RepositoryRepository.findByProjectId(task.projectId!);
+  const repositories: RepositoryInfo[] = [];
+
+  // Clone ALL repositories
+  if (githubToken && allRepos.length > 0) {
+    console.log(`[Tasks] Cloning ${allRepos.length} repositories for project ${task.projectId}`);
+
+    for (const repo of allRepos) {
+      const repoDir = path.join(workspacePath, repo.name);
+
+      if (!fs.existsSync(repoDir)) {
+        console.log(`[Tasks] Cloning ${repo.name} (${repo.type}) to ${repoDir}`);
+        await WorkspaceService.cloneWithToken(repo.githubRepoUrl, repoDir, githubToken);
+      }
+
+      // Build RepositoryInfo for this repo
+      repositories.push({
+        id: repo.id,
+        name: repo.name,
+        type: repo.type,
+        localPath: repoDir,
+        githubUrl: repo.githubRepoUrl,
+        branch: repo.githubBranch,
+        description: repo.description,
+        executionOrder: repo.executionOrder,
+      });
+    }
+
+    console.log(`[Tasks] Repositories ready: ${repositories.map(r => `${r.name}(${r.type})`).join(', ')}`);
+  } else if (task.repositoryId) {
+    // Fallback: single repo from task.repositoryId
+    const repo = getRepository(task.repositoryId);
+    if (repo && githubToken) {
+      const repoDir = path.join(workspacePath, repo.name);
+      if (!fs.existsSync(repoDir)) {
+        await WorkspaceService.cloneWithToken(repo.githubRepoUrl, repoDir, githubToken);
+      }
+      repositories.push({
+        id: repo.id,
+        name: repo.name,
+        type: repo.type,
+        localPath: repoDir,
+        githubUrl: repo.githubRepoUrl,
+        branch: repo.githubBranch,
+        description: repo.description,
+        executionOrder: repo.executionOrder,
+      });
     }
   }
 
@@ -186,24 +244,30 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
   socketService.toTask(task.id, 'task:started', { taskId: task.id, sessionId });
 
   // Run orchestration in background
-  const pipeline = project.settings.defaultPipeline || 'full';
-  const approvalMode = project.settings.approvalMode || 'manual';
+  const pipeline = project.settings?.defaultPipeline || 'full';
+  const approvalMode = project.settings?.approvalMode || 'manual';
 
   orchestrator.execute(task.id, pipeline, {
     projectPath: workspacePath,
+    repositories,
     approvalMode: approvalMode as ApprovalMode,
     onPhaseStart: (phase) => {
       execution.currentPhase = phase;
     },
     onPhaseComplete: async (phase, result) => {
-      // Commit changes after development phases
-      if (['Development', 'Fixer'].includes(phase) && repo && githubToken) {
-        const repoDir = path.join(workspacePath, repo.name);
-        await WorkspaceService.commitAndPush(
-          repoDir,
-          `[${phase}] ${task.title}`,
-          githubToken
-        );
+      // Commit changes after development phases - commit to ALL repos
+      if (['Development', 'Fixer'].includes(phase) && githubToken && repositories.length > 0) {
+        for (const repo of repositories) {
+          try {
+            await WorkspaceService.commitAndPush(
+              repo.localPath,
+              `[${phase}] ${task.title}`,
+              githubToken
+            );
+          } catch (err: any) {
+            console.warn(`[Tasks] Commit to ${repo.name} failed: ${err.message}`);
+          }
+        }
       }
     },
   }).then(result => {
@@ -386,6 +450,131 @@ router.get('/:taskId/status', (req: Request, res: Response) => {
       } : null,
     },
   });
+});
+
+// ===========================================
+// WORKSPACE ENDPOINTS
+// ===========================================
+
+/**
+ * GET /api/tasks/:taskId/workspace/files
+ * List all files in the task's workspace
+ */
+router.get('/:taskId/workspace/files', async (req: Request, res: Response) => {
+  const task = TaskRepository.findById(req.params.taskId);
+  if (!task) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  const workspacePath = path.join(WORKSPACES_DIR, task.id);
+
+  // Check if workspace exists
+  if (!fs.existsSync(workspacePath)) {
+    return res.json({ success: true, data: { files: [] } });
+  }
+
+  try {
+    // Recursively get all files
+    const files: string[] = [];
+
+    const walkDir = (dir: string, prefix = '') => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        // Skip .git and node_modules
+        if (entry.name === '.git' || entry.name === 'node_modules') continue;
+
+        const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+
+        if (entry.isDirectory()) {
+          walkDir(path.join(dir, entry.name), relativePath);
+        } else {
+          files.push(relativePath);
+        }
+      }
+    };
+
+    walkDir(workspacePath);
+
+    res.json({ success: true, data: { files } });
+  } catch (error: any) {
+    console.error('[Workspace] Error listing files:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/tasks/:taskId/workspace/file/*
+ * Read a specific file from the workspace
+ */
+router.get('/:taskId/workspace/file/*', async (req: Request, res: Response) => {
+  const task = TaskRepository.findById(req.params.taskId);
+  if (!task) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  // Get file path from URL (everything after /file/)
+  const filePath = req.params[0];
+  if (!filePath) {
+    return res.status(400).json({ error: 'File path required' });
+  }
+
+  const workspacePath = path.join(WORKSPACES_DIR, task.id);
+  const fullPath = path.join(workspacePath, filePath);
+
+  // Security: prevent path traversal
+  if (!fullPath.startsWith(workspacePath)) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  if (!fs.existsSync(fullPath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  try {
+    const stat = fs.statSync(fullPath);
+    if (stat.isDirectory()) {
+      return res.status(400).json({ error: 'Path is a directory' });
+    }
+
+    // Read file content
+    const content = fs.readFileSync(fullPath, 'utf-8');
+
+    res.json({
+      success: true,
+      data: {
+        content,
+        path: filePath,
+        size: stat.size,
+      }
+    });
+  } catch (error: any) {
+    console.error('[Workspace] Error reading file:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/tasks/:taskId/workspace/changes
+ * Get git changes in workspace
+ */
+router.get('/:taskId/workspace/changes', async (req: Request, res: Response) => {
+  const task = TaskRepository.findById(req.params.taskId);
+  if (!task) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  const workspacePath = path.join(WORKSPACES_DIR, task.id);
+
+  if (!fs.existsSync(workspacePath)) {
+    return res.json({ success: true, data: { hasChanges: false, files: [] } });
+  }
+
+  try {
+    const changes = await WorkspaceService.getChanges(workspacePath);
+    res.json({ success: true, data: changes });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 export default router;

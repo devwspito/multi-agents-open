@@ -18,6 +18,8 @@ export interface OpenCodeConfig {
 export interface SessionOptions {
   title: string;
   agent?: string;
+  /** Working directory for this session (where repo is cloned) */
+  directory?: string;
 }
 
 export interface PromptPart {
@@ -44,6 +46,7 @@ class OpenCodeClientService {
   private client: ReturnType<typeof createOpencodeClient> | null = null;
   private config: OpenCodeConfig;
   private connected = false;
+  private reconnecting = false;
 
   constructor() {
     this.config = {
@@ -70,6 +73,9 @@ class OpenCodeClientService {
       if (health.data?.healthy) {
         console.log(`[OpenCode] Connected. Version: ${health.data.version}`);
         this.connected = true;
+
+        // Configure provider authentication
+        await this.configureProviderAuth();
       } else {
         throw new Error('Server not healthy');
       }
@@ -77,6 +83,90 @@ class OpenCodeClientService {
       console.error(`[OpenCode] Failed to connect: ${error.message}`);
       throw new Error(`Cannot connect to OpenCode server at ${this.config.baseUrl}`);
     }
+  }
+
+  /**
+   * Configure provider authentication (API keys)
+   * SDK v2 uses flat params: { providerID, auth }
+   */
+  private async configureProviderAuth(): Promise<void> {
+    const client = this.getClient();
+
+    // Configure Anthropic if API key is available
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (anthropicKey) {
+      try {
+        await client.auth.set({
+          providerID: 'anthropic',
+          auth: { type: 'api', key: anthropicKey },
+        });
+        console.log('[OpenCode] Configured Anthropic authentication');
+      } catch (error: any) {
+        console.warn(`[OpenCode] Failed to set Anthropic auth: ${error.message}`);
+      }
+    }
+
+    // Configure OpenAI if API key is available
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (openaiKey) {
+      try {
+        await client.auth.set({
+          providerID: 'openai',
+          auth: { type: 'api', key: openaiKey },
+        });
+        console.log('[OpenCode] Configured OpenAI authentication');
+      } catch (error: any) {
+        console.warn(`[OpenCode] Failed to set OpenAI auth: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Connect with automatic retries (runs in background)
+   * Will keep trying until connected or maxRetries reached
+   */
+  async connectWithRetry(options?: {
+    maxRetries?: number;
+    initialDelay?: number;
+    maxDelay?: number;
+  }): Promise<void> {
+    if (this.connected || this.reconnecting) return;
+
+    const maxRetries = options?.maxRetries ?? 30; // ~5 minutes with backoff
+    const initialDelay = options?.initialDelay ?? 1000;
+    const maxDelay = options?.maxDelay ?? 10000;
+
+    this.reconnecting = true;
+    let attempt = 0;
+    let delay = initialDelay;
+
+    while (attempt < maxRetries && !this.connected) {
+      try {
+        await this.connect();
+        this.reconnecting = false;
+        return;
+      } catch {
+        attempt++;
+        if (attempt < maxRetries) {
+          console.log(`[OpenCode] Retry ${attempt}/${maxRetries} in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay = Math.min(delay * 1.5, maxDelay);
+        }
+      }
+    }
+
+    this.reconnecting = false;
+    if (!this.connected) {
+      console.error(`[OpenCode] Failed to connect after ${maxRetries} attempts`);
+    }
+  }
+
+  /**
+   * Start background reconnection (non-blocking)
+   */
+  startBackgroundReconnect(): void {
+    if (this.connected || this.reconnecting) return;
+    this.connectWithRetry().catch(() => {});
   }
 
   /**
@@ -98,36 +188,41 @@ class OpenCodeClientService {
 
   /**
    * Create a new session
+   * @param options.directory - Working directory for this session (overrides default)
    */
   async createSession(options: SessionOptions): Promise<string> {
     const client = this.getClient();
+    const directory = options.directory || this.config.directory;
 
     const session = await client.session.create({
       title: options.title,
-      directory: this.config.directory,
+      directory,
     });
 
     if (!session.data?.id) {
       throw new Error('Failed to create session');
     }
 
-    console.log(`[OpenCode] Created session: ${session.data.id}`);
+    console.log(`[OpenCode] Created session: ${session.data.id} (dir: ${directory || 'default'})`);
     return session.data.id;
   }
 
   /**
    * Send a prompt to a session
+   * @param options.directory - Working directory (overrides default)
    */
   async sendPrompt(sessionId: string, text: string, options?: {
     model?: { providerID: string; modelID: string };
     agent?: string;
     system?: string;
+    directory?: string;
   }): Promise<void> {
     const client = this.getClient();
+    const directory = options?.directory || this.config.directory;
 
     await client.session.prompt({
       sessionID: sessionId,
-      directory: this.config.directory,
+      directory,
       parts: [{ type: 'text', text }],
       ...(options?.model && { model: options.model }),
       ...(options?.agent && { agent: options.agent }),

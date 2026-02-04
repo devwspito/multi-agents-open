@@ -9,8 +9,9 @@
  * - We handle: Orchestration, tracking, security monitoring
  */
 
-import { Task } from '../types/index.js';
+import { Task, RepositoryInfo } from '../types/index.js';
 import { openCodeClient, OpenCodeEvent } from '../services/opencode/OpenCodeClient.js';
+import { openCodeEventBridge } from '../services/opencode/OpenCodeEventBridge.js';
 import { executionTracker } from '../services/training/ExecutionTracker.js';
 import { agentSpy, Vulnerability } from '../services/security/AgentSpy.js';
 import {
@@ -56,6 +57,8 @@ export interface OpenCodeExecutionResult {
 export interface PhaseContext {
   task: Task;
   projectPath: string;
+  /** All repositories for this project with their types */
+  repositories: RepositoryInfo[];
   previousResults: Map<string, PhaseResult>;
   variables: Map<string, any>;
 }
@@ -631,15 +634,25 @@ export abstract class BasePhase implements IPhase {
       prompt,
     });
 
-    // Create OpenCode session
+    // Create OpenCode session with the correct working directory
+    // CRITICAL: projectPath is where the user's repo was cloned
+    const workingDirectory = context.projectPath;
+    console.log(`[${this.name}] Using working directory: ${workingDirectory}`);
+
     const sessionId = await openCodeClient.createSession({
       title: `${this.name} - ${task.title}`,
+      directory: workingDirectory,
     });
 
     console.log(`[${this.name}] Created session: ${sessionId}`);
 
-    // Send prompt
-    await openCodeClient.sendPrompt(sessionId, prompt);
+    // CRITICAL: Register session for event forwarding to frontend
+    openCodeEventBridge.registerSession(task.id, sessionId);
+
+    // Send prompt with the same directory
+    await openCodeClient.sendPrompt(sessionId, prompt, {
+      directory: workingDirectory,
+    });
 
     // ========================================
     // EXECUTION STATE for Sentinental context
@@ -790,6 +803,9 @@ export abstract class BasePhase implements IPhase {
 
       console.log(`[${this.name}] Session completed - ${executionState.turns} turns, ${toolCalls.length} tool calls`);
 
+      // Unregister session from event bridge
+      openCodeEventBridge.unregisterSession(sessionId);
+
       return {
         sessionId,
         finalOutput: executionState.partialOutput,
@@ -799,6 +815,8 @@ export abstract class BasePhase implements IPhase {
         vulnerabilities,
       };
     } catch (error: any) {
+      // Unregister session on error too
+      openCodeEventBridge.unregisterSession(sessionId);
       executionTracker.failExecution(task.id, error.message, 'opencode_error');
       throw error;
     }

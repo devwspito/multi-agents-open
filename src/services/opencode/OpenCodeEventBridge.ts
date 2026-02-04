@@ -58,9 +58,12 @@ class OpenCodeEventBridgeService {
     console.log('[EventBridge] Starting event loop...');
 
     try {
+      console.log('[EventBridge] Subscribing to OpenCode events...');
       for await (const event of openCodeClient.subscribeToEvents()) {
+        console.log(`[EventBridge] >>> RAW EVENT: ${event.type}`);
         this.handleEvent(event);
       }
+      console.log('[EventBridge] Event stream ended');
     } catch (error: any) {
       console.error('[EventBridge] Event loop error:', error.message);
       this.eventLoopRunning = false;
@@ -76,26 +79,71 @@ class OpenCodeEventBridgeService {
    * Handle an OpenCode event and forward to frontend
    */
   private handleEvent(event: OpenCodeEvent): void {
+    // Log ALL events for debugging
+    console.log(`[EventBridge] Event received: ${event.type}`, JSON.stringify(event.properties || {}).slice(0, 200));
+
     const sessionId = event.properties?.sessionID;
-    if (!sessionId) return;
+    if (!sessionId) {
+      console.log(`[EventBridge] Event has no sessionID, skipping`);
+      return;
+    }
 
     const taskSession = this.activeSessions.get(sessionId);
-    if (!taskSession) return; // Event for a session we're not tracking
+    if (!taskSession) {
+      console.log(`[EventBridge] Session ${sessionId} not tracked, skipping`);
+      return;
+    }
 
     const { taskId } = taskSession;
+    console.log(`[EventBridge] Forwarding event ${event.type} to task ${taskId}`);
 
     // Transform OpenCode event to frontend-friendly format
     const frontendEvent = this.transformEvent(event, taskId);
     if (!frontendEvent) return;
 
-    // Send to frontend via WebSocket
+    // Send as the specific event type
     socketService.toTask(taskId, frontendEvent.type, frontendEvent.data);
 
-    // Also broadcast as notification
+    // Also send as 'agent:activity' for the Activity tab (frontend compatibility)
+    const activity = {
+      id: `activity-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      taskId,
+      type: frontendEvent.type,
+      timestamp: new Date(),
+      ...frontendEvent.data,
+    };
+    socketService.toTask(taskId, 'agent:activity', activity);
+
+    // Also broadcast as notification for Chat messages
     socketService.toTask(taskId, 'notification', {
       type: frontendEvent.type,
-      data: frontendEvent.data,
+      notification: {
+        type: this.mapToNotificationType(frontendEvent.type),
+        data: frontendEvent.data,
+      },
     });
+  }
+
+  /**
+   * Map internal event types to frontend notification types
+   */
+  private mapToNotificationType(type: string): string {
+    const mapping: Record<string, string> = {
+      'task_update': 'task_update',
+      'agent_completed': 'agent_completed',
+      'agent_failed': 'agent_failed',
+      'agent_progress': 'agent_progress',
+      'agent_output': 'agent_message',
+      'agent_message': 'agent_message',
+      'tool_call': 'agent_progress',
+      'tool_result': 'agent_progress',
+      'tool_error': 'agent_failed',
+      'file_activity': 'agent_progress',
+      'command_running': 'agent_progress',
+      'command_output': 'agent_progress',
+      'command_complete': 'agent_progress',
+    };
+    return mapping[type] || 'agent_progress';
   }
 
   /**
@@ -134,7 +182,7 @@ class OpenCodeEventBridgeService {
           },
         };
 
-      // Message/response events
+      // Message/response events (OpenCode SDK v2)
       case 'message.start':
         return {
           type: 'agent_progress',
@@ -144,6 +192,36 @@ class OpenCodeEventBridgeService {
             message: 'Agent is thinking...',
           },
         };
+
+      // OpenCode SDK v2 uses message.part.updated for streaming content
+      case 'message.part.updated':
+        const part = properties?.part;
+        if (part?.type === 'text') {
+          return {
+            type: 'agent_output',
+            data: {
+              taskId,
+              content: part.text || '',
+              streaming: true,
+            },
+          };
+        }
+        // Tool use part
+        if (part?.type === 'tool-invocation' || part?.type === 'tool-result') {
+          return {
+            type: 'agent_output',
+            data: {
+              taskId,
+              content: `[${part.toolName || 'tool'}] ${part.state || ''}`,
+              streaming: true,
+              toolInfo: {
+                name: part.toolName,
+                state: part.state,
+              },
+            },
+          };
+        }
+        return null;
 
       case 'message.delta':
       case 'message.chunk':
@@ -166,7 +244,8 @@ class OpenCodeEventBridgeService {
           },
         };
 
-      // Tool usage
+      // Tool usage (OpenCode SDK v2)
+      case 'tool.execute.before':
       case 'tool.start':
         return {
           type: 'tool_call',
@@ -174,10 +253,11 @@ class OpenCodeEventBridgeService {
             taskId,
             tool: properties?.tool || properties?.name,
             status: 'running',
-            input: properties?.input,
+            input: properties?.args || properties?.input,
           },
         };
 
+      case 'tool.execute.after':
       case 'tool.complete':
         return {
           type: 'tool_result',
@@ -185,7 +265,8 @@ class OpenCodeEventBridgeService {
             taskId,
             tool: properties?.tool || properties?.name,
             status: 'completed',
-            output: properties?.output,
+            output: properties?.result || properties?.output,
+            success: properties?.success !== false,
           },
         };
 

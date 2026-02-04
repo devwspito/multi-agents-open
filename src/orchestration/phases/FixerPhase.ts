@@ -40,9 +40,19 @@ export class FixerPhase extends BasePhase {
   }
 
   buildPrompt(context: PhaseContext): string {
-    const { task, projectPath } = context;
+    const { task, projectPath, repositories } = context;
     const judgeOutput = context.previousResults.get('Judge')?.output as JudgeOutput;
     const issues = context.variables.get('judgeIssues') || [];
+    const taskDescription = task.description || task.title;
+
+    // Build repository info section
+    let repoSection = '';
+    if (repositories && repositories.length > 0) {
+      repoSection = `## Available Repositories
+${repositories.map(repo => `- **${repo.name}** (${repo.type}): ${repo.localPath}`).join('\n')}
+
+`;
+    }
 
     // Format issues for the prompt
     const issuesText = issues.map((issue: any, i: number) => {
@@ -55,10 +65,9 @@ ${issue.suggestion ? `- **Suggested Fix**: ${issue.suggestion}` : ''}`;
     return `# Code Fix Task
 
 ## Original Task
-- **Title**: ${task.title}
-- **Description**: ${task.description || 'No description provided'}
+- **Task**: ${taskDescription}
 
-## Judge Review Summary
+${repoSection}## Judge Review Summary
 - **Verdict**: ${judgeOutput?.verdict || 'unknown'}
 - **Score**: ${judgeOutput?.score || 0}/100
 - **Summary**: ${judgeOutput?.summary || 'No summary'}
@@ -85,6 +94,7 @@ ${projectPath}
 - Don't introduce new issues while fixing
 - Critical and major issues MUST be fixed
 - Minor issues and suggestions are nice-to-have
+${repositories.length > 1 ? `- Issues may span MULTIPLE repositories (backend/frontend)` : ''}
 
 ## Output
 After fixing, summarize:

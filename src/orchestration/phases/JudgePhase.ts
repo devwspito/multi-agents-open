@@ -1,13 +1,14 @@
 /**
  * Judge Phase
  *
- * Reviews code changes made by Development phase.
+ * Reviews code changes made by Development phase for a SINGLE STORY.
  * Provides structured feedback and verdict (approved/rejected).
  *
  * Uses OpenCode SDK for agent execution.
  */
 
 import { BasePhase, PhaseContext, PhaseResult, OpenCodeExecutionResult } from '../Phase.js';
+import { Story } from '../../types/index.js';
 
 export type JudgeVerdict = 'approved' | 'rejected' | 'needs_revision';
 
@@ -40,17 +41,92 @@ export class JudgePhase extends BasePhase {
   }
 
   buildPrompt(context: PhaseContext): string {
-    const { task, projectPath } = context;
+    const { task, projectPath, repositories } = context;
     const filesModified = context.variables.get('filesModified') || [];
     const devOutput = context.previousResults.get('Development')?.output;
+    const currentStory = context.variables.get('currentStory') as Story | undefined;
+    const storyIndex = context.variables.get('storyIndex') as number || 0;
+    const totalStories = context.variables.get('totalStories') as number || 1;
+
+    // Build repository info section
+    let repoSection = '';
+    if (repositories && repositories.length > 0) {
+      repoSection = `## Available Repositories
+${repositories.map(repo => `- **${repo.name}** (${repo.type}): ${repo.localPath}`).join('\n')}
+
+`;
+    }
+
+    // Build story-specific prompt if we have a story
+    if (currentStory) {
+      const acceptanceCriteria = currentStory.acceptanceCriteria?.map((c, i) => `${i + 1}. ${c}`).join('\n') || 'None specified';
+
+      return `# Code Review for Story ${storyIndex + 1}/${totalStories}
+
+## Story Details
+- **ID**: ${currentStory.id}
+- **Title**: ${currentStory.title}
+- **Description**: ${currentStory.description}
+
+${repoSection}## Acceptance Criteria
+${acceptanceCriteria}
+
+## Development Summary
+${devOutput?.summary || 'No development summary available'}
+
+## Files Modified
+${filesModified.length > 0 ? filesModified.map((f: string) => `- ${f}`).join('\n') : 'No files recorded'}
+
+## Your Mission
+Review the code changes FOR THIS STORY ONLY and provide a structured verdict.
+
+## Instructions
+1. Read each modified file using the Read tool
+2. Check for:
+   - **Acceptance Criteria**: Are ALL criteria met?
+   - **Correctness**: Does the code do what it should?
+   - **Security**: Any vulnerabilities? (SQL injection, XSS, etc.)
+   - **Code Quality**: Clean, readable, maintainable?
+   - **Patterns**: Does it follow project conventions?
+${repositories.length > 1 ? `   - **Cross-Repo Consistency**: Are frontend/backend changes aligned?` : ''}
+
+## Project Path
+${projectPath}
+
+## Required Output Format
+You MUST output a JSON block with this exact structure:
+
+\`\`\`json
+{
+  "verdict": "approved" | "rejected" | "needs_revision",
+  "score": <number 0-100>,
+  "summary": "<brief summary of your review>",
+  "issues": [
+    {
+      "severity": "critical" | "major" | "minor" | "suggestion",
+      "file": "<file path>",
+      "description": "<what's wrong>",
+      "suggestion": "<how to fix>"
+    }
+  ]
+}
+\`\`\`
+
+## Verdict Guidelines
+- **approved**: Score >= 80, acceptance criteria met, no critical/major issues
+- **needs_revision**: Score 50-79, has issues but fixable
+- **rejected**: Score < 50, fundamental problems`;
+    }
+
+    // Fallback to original prompt if no story context
+    const taskDescription = task.description || task.title;
 
     return `# Code Review Task
 
 ## Original Task
-- **Title**: ${task.title}
-- **Description**: ${task.description || 'No description provided'}
+- **Task**: ${taskDescription}
 
-## Development Summary
+${repoSection}## Development Summary
 ${devOutput?.summary || 'No development summary available'}
 
 ## Files Modified
@@ -67,6 +143,7 @@ Review the code changes and provide a structured verdict.
    - **Code Quality**: Clean, readable, maintainable?
    - **Patterns**: Does it follow project conventions?
    - **Edge Cases**: Are edge cases handled?
+${repositories.length > 1 ? `   - **Cross-Repo Consistency**: Are frontend/backend changes aligned?` : ''}
 
 ## Project Path
 ${projectPath}
@@ -110,13 +187,14 @@ Review criteria:
 - Security: No vulnerabilities?
 - Quality: Clean, readable, documented?
 - Patterns: Follows project conventions?
+- Acceptance Criteria: All criteria met?
 
 Be objective and specific. Always explain WHY something is an issue.
 Output MUST include a JSON block with verdict, score, summary, and issues.`;
   }
 
   async processOutput(result: OpenCodeExecutionResult, context: PhaseContext): Promise<PhaseResult> {
-    // Parse verdict from output
+    const currentStory = context.variables.get('currentStory') as Story | undefined;
     const output = result.finalOutput;
     let judgeOutput: JudgeOutput;
 
@@ -170,7 +248,8 @@ Output MUST include a JSON block with verdict, score, summary, and issues.`;
     context.variables.set('judgeScore', judgeOutput.score);
     context.variables.set('judgeIssues', judgeOutput.issues);
 
-    console.log(`[JudgePhase] Verdict: ${judgeOutput.verdict} (score: ${judgeOutput.score})`);
+    const storyInfo = currentStory ? ` for story "${currentStory.title}"` : '';
+    console.log(`[JudgePhase] Verdict${storyInfo}: ${judgeOutput.verdict} (score: ${judgeOutput.score})`);
     if (judgeOutput.issues.length > 0) {
       console.log(`[JudgePhase] Issues found: ${judgeOutput.issues.length}`);
       for (const issue of judgeOutput.issues) {
@@ -188,6 +267,7 @@ Output MUST include a JSON block with verdict, score, summary, and issues.`;
         vulnerabilities: result.vulnerabilities.length,
         verdict: judgeOutput.verdict,
         score: judgeOutput.score,
+        storyId: currentStory?.id,
       },
     };
   }
