@@ -10,6 +10,7 @@
  */
 export type TaskStatus =
   | 'pending'
+  | 'queued'      // Added to BullMQ queue, waiting for worker
   | 'running'
   | 'paused'
   | 'completed'
@@ -85,10 +86,22 @@ export interface Task {
   title: string;
   description?: string;
   status: TaskStatus;
+  /** Branch created for this task */
+  branchName?: string;
+  /** Analysis result from AnalysisPhase */
+  analysis?: {
+    summary: string;
+    approach: string;
+    risks: string[];
+  };
   /** Stories broken down from the task */
   stories?: Story[];
   /** Current story index being processed */
   currentStoryIndex?: number;
+  /** Pull Request number */
+  prNumber?: number;
+  /** Pull Request URL */
+  prUrl?: string;
   createdAt: Date;
   updatedAt: Date;
 }

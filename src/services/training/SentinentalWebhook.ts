@@ -20,6 +20,7 @@
  */
 
 import { agentSpy, Vulnerability } from '../security/AgentSpy.js';
+import { SentinentalRepository } from '../../database/repositories/SentinentalRepository.js';
 
 // ============================================
 // PLATINO TRACE INTERFACES
@@ -374,6 +375,14 @@ class SentinentalWebhookService {
       summary: this.buildSummary(filtered, avgCvssScore, platino?.taskHistory),
     };
 
+    // PERSIST TO POSTGRESQL FIRST (backup before HTTP send)
+    try {
+      await SentinentalRepository.create(record);
+      console.log(`[Sentinental] Persisted record ${record.id} to PostgreSQL`);
+    } catch (dbError: any) {
+      console.warn(`[Sentinental] PostgreSQL persist failed (continuing with HTTP): ${dbError.message}`);
+    }
+
     this.buffer.push(record);
     console.log(`[Sentinental] Buffered ${filtered.length} vulnerabilities from ${phase} [${traceLevel}] (risk: ${record.summary.riskScore}, cvss: ${avgCvssScore.toFixed(1)}) (${this.buffer.length}/${this.config.batchSize})`);
 
@@ -621,6 +630,7 @@ class SentinentalWebhookService {
     if (this.buffer.length === 0) return;
 
     const batch = [...this.buffer];
+    const batchIds = batch.map(r => r.id);
     this.buffer = [];
 
     try {
@@ -639,30 +649,105 @@ class SentinentalWebhookService {
 
       const totalVulns = batch.reduce((sum, r) => sum + r.vulnerabilities.length, 0);
       console.log(`[Sentinental] Pushed ${batch.length} records (${totalVulns} vulnerabilities) to DGX Spark`);
+
+      // Mark as sent in PostgreSQL
+      try {
+        await SentinentalRepository.markSent(batchIds);
+      } catch (dbError: any) {
+        console.warn(`[Sentinental] Failed to mark records as sent in PostgreSQL: ${dbError.message}`);
+      }
     } catch (error: any) {
       // Re-buffer on failure
       this.buffer = [...batch, ...this.buffer];
       console.error(`[Sentinental] Push failed, ${batch.length} records re-buffered: ${error.message}`);
+
+      // Mark send attempt failed in PostgreSQL
+      try {
+        await SentinentalRepository.markSendFailed(batchIds, error.message);
+      } catch (dbError: any) {
+        console.warn(`[Sentinental] Failed to mark send failure in PostgreSQL: ${dbError.message}`);
+      }
     }
   }
 
   /**
-   * Get current status
+   * Get current status (includes PostgreSQL stats)
    */
-  getStatus(): {
+  async getStatus(): Promise<{
     enabled: boolean;
     url: string;
     bufferedRecords: number;
     batchSize: number;
     minSeverity: string;
-  } {
+    postgres: {
+      total: number;
+      sent: number;
+      pending: number;
+      failed: number;
+    };
+  }> {
+    let postgresStats = { total: 0, sent: 0, pending: 0, failed: 0 };
+    try {
+      const stats = await SentinentalRepository.getStats();
+      postgresStats = {
+        total: stats.total,
+        sent: stats.sent,
+        pending: stats.pending,
+        failed: stats.failed,
+      };
+    } catch {
+      // Table may not exist yet
+    }
+
     return {
       enabled: this.config.enabled || false,
       url: this.config.url,
       bufferedRecords: this.buffer.length,
       batchSize: this.config.batchSize || 10,
       minSeverity: this.config.minSeverity || 'low',
+      postgres: postgresStats,
     };
+  }
+
+  /**
+   * Retry sending failed records from PostgreSQL
+   */
+  async retryFailed(limit: number = 50): Promise<{ sent: number; failed: number }> {
+    if (!this.config.enabled) return { sent: 0, failed: 0 };
+
+    try {
+      const pendingRecords = await SentinentalRepository.findPending(limit);
+      if (pendingRecords.length === 0) {
+        console.log('[Sentinental] No pending records to retry');
+        return { sent: 0, failed: 0 };
+      }
+
+      // Convert back to SecurityTrainingRecord format
+      const records = pendingRecords.map(r => SentinentalRepository.toTrainingRecord(r));
+      const recordIds = pendingRecords.map(r => r.id);
+
+      // Send to Sentinental
+      const response = await fetch(this.config.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-ndjson',
+          ...(this.config.apiKey && { 'Authorization': `Bearer ${this.config.apiKey}` }),
+        },
+        body: records.map(r => JSON.stringify(r)).join('\n'),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      // Mark as sent
+      await SentinentalRepository.markSent(recordIds);
+      console.log(`[Sentinental] Retry successful: ${recordIds.length} records sent`);
+      return { sent: recordIds.length, failed: 0 };
+    } catch (error: any) {
+      console.error(`[Sentinental] Retry failed: ${error.message}`);
+      return { sent: 0, failed: 1 };
+    }
   }
 
   private buildSummary(

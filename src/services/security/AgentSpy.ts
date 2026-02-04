@@ -91,7 +91,7 @@ export interface Vulnerability {
   owaspCategory?: string;
   /** CWE ID (e.g., CWE-79 for XSS) */
   cweId?: string;
-  /** File path where vulnerability was detected */
+  /** File path where vulnerability was detected (relative) */
   filePath?: string;
   /** Line number in file */
   lineNumber?: number;
@@ -99,6 +99,16 @@ export interface Vulnerability {
   codeSnippet?: string;
   /** Recommended fix for the vulnerability */
   recommendation?: string;
+
+  // === PATHS FOR LOCAL ACCESS (Sentinental can read directly) ===
+  /** Absolute path to workspace root */
+  workspacePath?: string;
+  /** Absolute path to the file (workspacePath + filePath) */
+  absoluteFilePath?: string;
+  /** Story ID if vulnerability is from Developer phase */
+  storyId?: string;
+  /** Iteration number when detected */
+  iteration?: number;
 }
 
 export interface SpyMetrics {
@@ -1062,7 +1072,7 @@ class AgentSpyService {
   }
 
   private createVulnerability(
-    context: { taskId: string; sessionId: string; phase: string },
+    context: { taskId: string; sessionId: string; phase: string; storyId?: string; workspacePath?: string; iteration?: number },
     data: {
       severity: VulnerabilitySeverity;
       type: VulnerabilityType;
@@ -1082,6 +1092,15 @@ class AgentSpyService {
     const cweId = CWE_MAPPINGS[data.type];
     const recommendation = RECOMMENDATIONS[data.type];
 
+    // Build absolute path if we have workspace and file path
+    let absoluteFilePath: string | undefined;
+    if (context.workspacePath && data.filePath) {
+      const path = require('path');
+      absoluteFilePath = path.isAbsolute(data.filePath)
+        ? data.filePath
+        : path.join(context.workspacePath, data.filePath);
+    }
+
     return {
       id: this.generateId(),
       taskId: context.taskId,
@@ -1093,6 +1112,11 @@ class AgentSpyService {
       owaspCategory,
       cweId,
       recommendation,
+      // Paths for local access (Sentinental can read directly)
+      workspacePath: context.workspacePath,
+      absoluteFilePath,
+      storyId: context.storyId,
+      iteration: context.iteration,
     };
   }
 
@@ -1153,6 +1177,277 @@ class AgentSpyService {
    */
   shouldBlock(vulnerability: Vulnerability): boolean {
     return vulnerability.blocked;
+  }
+
+  // ============================================================================
+  // WORKSPACE SCAN - Full codebase analysis at end of iteration
+  // ============================================================================
+
+  /**
+   * Scan workspace for vulnerabilities after iteration completes
+   * Called at end of each iteration: ANALYST→JUDGE→SPY or DEV→JUDGE→SPY
+   *
+   * @param workspacePath - Directory to scan
+   * @param context - Task/session/phase context
+   * @param options - Scan options (files to focus on, etc.)
+   * @returns Array of vulnerabilities found (DOES NOT BLOCK)
+   */
+  async scanWorkspace(
+    workspacePath: string,
+    context: { taskId: string; sessionId: string; phase: string; storyId?: string; iteration?: number },
+    options?: {
+      filesToScan?: string[];
+      maxFiles?: number;
+      maxFileSize?: number;
+    }
+  ): Promise<Vulnerability[]> {
+    const detected: Vulnerability[] = [];
+    const fs = await import('fs');
+    const path = await import('path');
+
+    const maxFiles = options?.maxFiles ?? 100;
+    const maxFileSize = options?.maxFileSize ?? 500 * 1024; // 500KB max per file
+    let filesScanned = 0;
+
+    // Ensure workspacePath is absolute
+    const absoluteWorkspacePath = path.default.isAbsolute(workspacePath)
+      ? workspacePath
+      : path.default.resolve(workspacePath);
+
+    console.log(`[AgentSpy] Scanning workspace: ${absoluteWorkspacePath} (phase: ${context.phase}, story: ${context.storyId || 'N/A'})`);
+
+    // Enrich context with workspace path for Sentinental
+    const enrichedContext = {
+      ...context,
+      workspacePath: absoluteWorkspacePath,
+    };
+
+    try {
+      // Get list of files to scan
+      let filesToScan = options?.filesToScan;
+
+      if (!filesToScan || filesToScan.length === 0) {
+        // Auto-detect: scan recently modified files or common code files
+        filesToScan = await this.findCodeFiles(absoluteWorkspacePath, maxFiles);
+      }
+
+      for (const filePath of filesToScan) {
+        if (filesScanned >= maxFiles) break;
+
+        const fullPath = path.default.isAbsolute(filePath) ? filePath : path.default.join(absoluteWorkspacePath, filePath);
+
+        try {
+          const stat = fs.default.statSync(fullPath);
+          if (!stat.isFile() || stat.size > maxFileSize) continue;
+
+          const content = fs.default.readFileSync(fullPath, 'utf-8');
+          const fileVulns = this.scanFileContent(fullPath, content, enrichedContext);
+          detected.push(...fileVulns);
+          filesScanned++;
+        } catch {
+          // File not accessible, skip
+          continue;
+        }
+      }
+
+      // Store vulnerabilities
+      if (detected.length > 0) {
+        const existing = this.vulnerabilities.get(context.taskId) || [];
+        this.vulnerabilities.set(context.taskId, [...existing, ...detected]);
+
+        // Update metrics
+        const metrics = this.metrics.get(context.taskId) || {
+          totalEvents: 0,
+          toolCalls: 0,
+          vulnerabilitiesDetected: 0,
+          bySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
+          byType: {},
+          byCategory: {},
+        };
+
+        for (const v of detected) {
+          metrics.vulnerabilitiesDetected++;
+          metrics.bySeverity[v.severity]++;
+          metrics.byType[v.type] = (metrics.byType[v.type] || 0) + 1;
+          metrics.byCategory[v.category] = (metrics.byCategory[v.category] || 0) + 1;
+        }
+
+        this.metrics.set(context.taskId, metrics);
+      }
+
+      console.log(`[AgentSpy] Workspace scan complete: ${filesScanned} files, ${detected.length} vulnerabilities found`);
+
+    } catch (error: any) {
+      console.warn(`[AgentSpy] Workspace scan error: ${error.message}`);
+    }
+
+    return detected;
+  }
+
+  /**
+   * Scan a single file's content for vulnerabilities
+   */
+  private scanFileContent(
+    filePath: string,
+    content: string,
+    context: { taskId: string; sessionId: string; phase: string; storyId?: string; workspacePath?: string; iteration?: number }
+  ): Vulnerability[] {
+    const detected: Vulnerability[] = [];
+    const lines = content.split('\n');
+
+    // 1. Scan for secrets
+    for (const { pattern, severity, description } of SECRET_PATTERNS) {
+      for (let i = 0; i < lines.length; i++) {
+        if (pattern.test(lines[i])) {
+          detected.push(this.createVulnerability(context, {
+            severity,
+            type: 'secret_exposure',
+            category: 'secrets',
+            description: `Secret found in code: ${description}`,
+            evidence: { filePath, pattern: pattern.toString() },
+            toolName: 'workspace_scan',
+            blocked: false, // NEVER BLOCK - just report
+            matchedPattern: pattern.toString(),
+            filePath,
+            lineNumber: i + 1,
+            codeSnippet: lines[i].slice(0, 200),
+          }));
+          break; // One per pattern per file
+        }
+      }
+    }
+
+    // 2. Scan for code injection patterns
+    for (const { pattern, severity, type, description } of CODE_INJECTION_PATTERNS) {
+      for (let i = 0; i < lines.length; i++) {
+        if (pattern.test(lines[i])) {
+          detected.push(this.createVulnerability(context, {
+            severity,
+            type,
+            category: 'code_injection',
+            description,
+            evidence: { filePath, pattern: pattern.toString() },
+            toolName: 'workspace_scan',
+            blocked: false,
+            matchedPattern: pattern.toString(),
+            filePath,
+            lineNumber: i + 1,
+            codeSnippet: lines[i].slice(0, 200),
+          }));
+          break;
+        }
+      }
+    }
+
+    // 3. Scan for sensitive file paths in code
+    for (const { pattern, severity, description } of SENSITIVE_PATHS) {
+      for (let i = 0; i < lines.length; i++) {
+        if (pattern.test(lines[i])) {
+          detected.push(this.createVulnerability(context, {
+            severity,
+            type: 'sensitive_file_access',
+            category: 'file_system',
+            description,
+            evidence: { filePath, pattern: pattern.toString() },
+            toolName: 'workspace_scan',
+            blocked: false,
+            matchedPattern: pattern.toString(),
+            filePath,
+            lineNumber: i + 1,
+            codeSnippet: lines[i].slice(0, 200),
+          }));
+          break;
+        }
+      }
+    }
+
+    // 4. Scan for dangerous commands in scripts/config
+    if (filePath.endsWith('.sh') || filePath.endsWith('.bash') || filePath.includes('package.json')) {
+      for (const { pattern, severity, description } of DANGEROUS_COMMANDS) {
+        for (let i = 0; i < lines.length; i++) {
+          if (pattern.test(lines[i])) {
+            detected.push(this.createVulnerability(context, {
+              severity,
+              type: 'dangerous_command',
+              category: 'system_destruction',
+              description,
+              evidence: { filePath, pattern: pattern.toString() },
+              toolName: 'workspace_scan',
+              blocked: false,
+              matchedPattern: pattern.toString(),
+              filePath,
+              lineNumber: i + 1,
+              codeSnippet: lines[i].slice(0, 200),
+            }));
+            break;
+          }
+        }
+      }
+    }
+
+    return detected;
+  }
+
+  /**
+   * Find code files in workspace
+   */
+  private async findCodeFiles(workspacePath: string, maxFiles: number): Promise<string[]> {
+    const fs = await import('fs');
+    const path = await import('path');
+    const files: string[] = [];
+
+    const codeExtensions = [
+      '.ts', '.js', '.tsx', '.jsx', '.py', '.rb', '.go', '.java',
+      '.sh', '.bash', '.yml', '.yaml', '.json', '.env', '.sql'
+    ];
+
+    const ignoreDirs = ['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', 'venv'];
+
+    const walkDir = (dir: string, depth: number = 0): void => {
+      if (depth > 5 || files.length >= maxFiles) return;
+
+      try {
+        const entries = fs.default.readdirSync(dir, { withFileTypes: true });
+
+        for (const entry of entries) {
+          if (files.length >= maxFiles) break;
+
+          const fullPath = path.default.join(dir, entry.name);
+
+          if (entry.isDirectory()) {
+            if (!ignoreDirs.includes(entry.name) && !entry.name.startsWith('.')) {
+              walkDir(fullPath, depth + 1);
+            }
+          } else if (entry.isFile()) {
+            const ext = path.default.extname(entry.name).toLowerCase();
+            if (codeExtensions.includes(ext) || entry.name.startsWith('.env')) {
+              files.push(fullPath);
+            }
+          }
+        }
+      } catch {
+        // Directory not accessible
+      }
+    };
+
+    walkDir(workspacePath);
+    return files;
+  }
+
+  /**
+   * Get vulnerabilities for a specific story
+   */
+  getVulnerabilitiesByStory(taskId: string, storyId: string): Vulnerability[] {
+    const all = this.vulnerabilities.get(taskId) || [];
+    return all.filter(v => (v as any).storyId === storyId);
+  }
+
+  /**
+   * Get vulnerabilities for a specific phase
+   */
+  getVulnerabilitiesByPhase(taskId: string, phase: string): Vulnerability[] {
+    const all = this.vulnerabilities.get(taskId) || [];
+    return all.filter(v => v.phase === phase);
   }
 }
 
