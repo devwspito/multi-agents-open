@@ -6,6 +6,7 @@
  */
 
 import { db, generateId, now } from '../index.js';
+import { CryptoService } from '../../services/security/CryptoService.js';
 
 export interface IEnvVariable {
   key: string;
@@ -336,6 +337,21 @@ export class RepositoryRepository {
    * Get default repository config based on type
    */
   static getDefaultConfig = getRepositoryConfig;
+
+  /**
+   * Get decrypted environment variables for a repository
+   */
+  static getDecryptedEnvVariables(id: string): IEnvVariable[] {
+    const repo = this.findById(id);
+    if (!repo) return [];
+
+    return repo.envVariables.map(envVar => {
+      if (envVar.isSecret && envVar.value) {
+        return { ...envVar, value: CryptoService.decrypt(envVar.value) };
+      }
+      return envVar;
+    });
+  }
 }
 
 export default RepositoryRepository;
