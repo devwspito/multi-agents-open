@@ -14,6 +14,7 @@ import { orchestrator, ApprovalMode } from '../../orchestration/index.js';
 import { openCodeClient, openCodeEventBridge } from '../../services/opencode/index.js';
 import { socketService, approvalService } from '../../services/realtime/index.js';
 import { WorkspaceService } from '../../services/workspace/index.js';
+import { EnvService } from '../../services/env/EnvService.js';
 import { RepositoryInfo } from '../../types/index.js';
 import { v4 as uuid } from 'uuid';
 import * as path from 'path';
@@ -180,6 +181,12 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
         await WorkspaceService.cloneWithToken(repo.githubRepoUrl, repoDir, githubToken);
       }
 
+      // Generate .env file with decrypted environment variables
+      if (repo.envVariables && repo.envVariables.length > 0) {
+        console.log(`[Tasks] Generating .env for ${repo.name} (${repo.envVariables.length} vars)`);
+        await EnvService.writeEnvFile(repoDir, repo.envVariables);
+      }
+
       // Build RepositoryInfo for this repo
       repositories.push({
         id: repo.id,
@@ -202,6 +209,13 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
       if (!fs.existsSync(repoDir)) {
         await WorkspaceService.cloneWithToken(repo.githubRepoUrl, repoDir, githubToken);
       }
+
+      // Generate .env file with decrypted environment variables
+      if (repo.envVariables && repo.envVariables.length > 0) {
+        console.log(`[Tasks] Generating .env for ${repo.name} (${repo.envVariables.length} vars)`);
+        await EnvService.writeEnvFile(repoDir, repo.envVariables);
+      }
+
       repositories.push({
         id: repo.id,
         name: repo.name,
