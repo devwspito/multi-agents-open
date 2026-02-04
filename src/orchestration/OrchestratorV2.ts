@@ -1,19 +1,21 @@
 /**
  * Orchestrator V2
  *
- * Clean 3-phase architecture:
+ * 4-phase architecture:
  * 1. Analysis Phase - Create branch, analyze task, break into stories
- * 2. Developer Phase - Implement all stories with DEV → JUDGE → FIX loop
+ * 2. Developer Phase - Implement all stories with DEV → JUDGE → SPY loop
  * 3. Merge Phase - Create PR, wait for approval, merge
+ * 4. Global Scan Phase - ALWAYS runs, comprehensive security scan
  *
  * Key principles:
  * - One OpenCode session per phase (not per story)
  * - All Git operations happen at HOST level
- * - Security analysis (AgentSpy) runs at end of each iteration
+ * - SPY runs at end of each iteration within phases
+ * - Global Scan runs at the END, always, even if Merge fails
  * - All data pushed to Sentinental for ML training
  */
 
-import { Task, Story, RepositoryInfo } from '../types/index.js';
+import { Task, Story, RepositoryInfo, GlobalVulnerabilityScan } from '../types/index.js';
 import { TaskRepository } from '../database/repositories/TaskRepository.js';
 import { sentinentalWebhook } from '../services/training/index.js';
 import { socketService } from '../services/realtime/index.js';
@@ -35,6 +37,11 @@ import {
   MergePhaseContext,
   MergeResult,
 } from './phases/MergePhaseV2.js';
+import {
+  executeGlobalScanPhase,
+  GlobalScanPhaseContext,
+  GlobalScanResult,
+} from './phases/GlobalScanPhaseV2.js';
 
 export type ApprovalMode = 'manual' | 'automatic';
 
@@ -71,6 +78,8 @@ export interface OrchestrationResult {
   analysis?: AnalysisResult;
   developer?: DeveloperResult;
   merge?: MergeResult;
+  /** Global scan - ALWAYS runs at the end */
+  globalScan?: GlobalScanResult;
   error?: string;
   duration: number;
 }
@@ -218,42 +227,39 @@ class OrchestratorV2Class {
       console.log(`[OrchestratorV2] Merge complete: PR ${mergeResult.pullRequest?.number || 'N/A'}, merged: ${mergeResult.merged}`);
 
     } catch (error: any) {
-      console.error(`[OrchestratorV2] Error: ${error.message}`);
-
-      await TaskRepository.updateStatus(taskId, 'failed');
-
-      socketService.toTask(taskId, 'orchestration:complete', {
-        success: false,
-        error: error.message,
-        duration: Date.now() - startTime,
-      });
-
-      // Still push to Sentinental for training data
-      sentinentalWebhook.push(taskId).catch(err => {
-        console.warn(`[OrchestratorV2] Failed to push to Sentinental: ${err.message}`);
-      });
-
-      cleanupTaskTracking(taskId);
-
-      return {
-        success: false,
-        taskId,
-        analysis: analysisResult,
-        developer: developerResult,
-        merge: mergeResult,
-        error: error.message,
-        duration: Date.now() - startTime,
-      };
+      console.error(`[OrchestratorV2] Error in phases: ${error.message}`);
+      // Don't return yet - we still need to run Global Scan
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // PHASE 4: GLOBAL SCAN (ALWAYS RUNS)
+    // ════════════════════════════════════════════════════════════════
+    console.log(`\n${'─'.repeat(70)}`);
+    console.log(`[OrchestratorV2] PHASE 4: GLOBAL SCAN (Final Security Analysis)`);
+    console.log(`${'─'.repeat(70)}`);
+
+    let globalScanResult: GlobalScanResult | undefined;
+
+    const globalScanContext: GlobalScanPhaseContext = {
+      task,
+      repositories,
+      sessionId: developerResult?.sessionId || analysisResult?.sessionId,
+      branchName: analysisResult?.branchName,
+      mergeSuccess: mergeResult?.success,
+    };
+
+    globalScanResult = await executeGlobalScanPhase(globalScanContext);
+
+    console.log(`[OrchestratorV2] Global scan complete: ${globalScanResult.summary.totalVulnerabilities} vulnerabilities found`);
 
     // ════════════════════════════════════════════════════════════════
     // COMPLETION
     // ════════════════════════════════════════════════════════════════
-    const success = mergeResult?.success ?? false;
+    const success = (mergeResult?.success ?? false) && (globalScanResult?.success ?? false);
     const duration = Date.now() - startTime;
 
-    // Update task status
-    await TaskRepository.updateStatus(taskId, success ? 'completed' : 'failed');
+    // Update task status (merge determines success, global scan is informational)
+    await TaskRepository.updateStatus(taskId, mergeResult?.success ? 'completed' : 'failed');
 
     // Notify frontend
     socketService.toTask(taskId, 'orchestration:complete', {
@@ -263,16 +269,23 @@ class OrchestratorV2Class {
         sessionId: analysisResult?.sessionId,
         stories: analysisResult?.stories.length,
         branchName: analysisResult?.branchName,
+        spyVulnerabilities: analysisResult?.analysis.vulnerabilities.length || 0,
       },
       developer: {
         sessionId: developerResult?.sessionId,
         commits: developerResult?.totalCommits,
         approved: developerResult?.stories.filter(r => r.verdict === 'approved').length,
+        spyVulnerabilities: developerResult?.stories.reduce((sum, s) => sum + s.vulnerabilities.length, 0) || 0,
       },
       merge: {
         prNumber: mergeResult?.pullRequest?.number,
         prUrl: mergeResult?.pullRequest?.url,
         merged: mergeResult?.merged,
+      },
+      globalScan: {
+        totalFiles: globalScanResult?.summary.totalFilesScanned,
+        totalVulnerabilities: globalScanResult?.summary.totalVulnerabilities,
+        bySeverity: globalScanResult?.scan.bySeverity,
       },
     });
 
@@ -285,18 +298,20 @@ class OrchestratorV2Class {
     cleanupTaskTracking(taskId);
 
     console.log(`\n${'═'.repeat(70)}`);
-    console.log(`[OrchestratorV2] Task ${success ? 'COMPLETED' : 'FAILED'}`);
+    console.log(`[OrchestratorV2] Task ${mergeResult?.success ? 'COMPLETED' : 'FAILED'}`);
     console.log(`  Duration: ${Math.round(duration / 1000)}s`);
     console.log(`  Stories: ${developerResult?.stories.filter(r => r.verdict === 'approved').length}/${analysisResult?.stories.length}`);
     console.log(`  PR: ${mergeResult?.pullRequest?.url || 'N/A'}`);
+    console.log(`  Global Scan: ${globalScanResult?.summary.totalVulnerabilities} vulnerabilities`);
     console.log(`${'═'.repeat(70)}\n`);
 
     return {
-      success,
+      success: mergeResult?.success ?? false,
       taskId,
       analysis: analysisResult,
       developer: developerResult,
       merge: mergeResult,
+      globalScan: globalScanResult,
       duration,
     };
   }

@@ -238,31 +238,33 @@ export interface GlobalVulnerabilityScan {
 
 /**
  * Analysis Phase V2 Result
+ *
+ * Note: Global scan runs as SEPARATE FINAL PHASE after Merge
+ * analysis.vulnerabilities = SPY findings during analysis iterations
  */
 export interface AnalysisResultV2 {
   success: boolean;
   sessionId: string;
-  /** Analysis WITH vulnerabilities */
+  /** Analysis WITH vulnerabilities from SPY */
   analysis: AnalysisDataV2;
-  /** Stories (each with its own vulnerabilities array - empty until Developer phase) */
+  /** Stories (vulnerabilities filled during Developer phase) */
   stories: StoryResultV2[];
   branchName: string;
-  /** Global scan of entire workspace */
-  globalVulnerabilities: GlobalVulnerabilityScan;
   error?: string;
 }
 
 /**
  * Developer Phase V2 Result
+ *
+ * Note: Global scan runs as SEPARATE FINAL PHASE after Merge
+ * stories[].vulnerabilities = SPY findings per story iteration
  */
 export interface DeveloperResultV2 {
   success: boolean;
   sessionId: string;
-  /** Stories WITH vulnerabilities per story */
+  /** Stories WITH vulnerabilities from SPY per story */
   stories: StoryResultV2[];
   totalCommits: number;
-  /** Global scan after all stories complete */
-  globalVulnerabilities: GlobalVulnerabilityScan;
   error?: string;
 }
 

@@ -1,15 +1,15 @@
 /**
  * Developer Phase V2
  *
- * New architecture with proper vulnerability structure:
- * - stories[]: each story has its own vulnerabilities array
- * - globalVulnerabilities: full scan of ALL repositories at end of phase
+ * Architecture:
+ * - stories[]: each story has its own vulnerabilities from SPY
  *
  * Flow per story:
- * 1. DEV → JUDGE → SPY loop
+ * 1. DEV → JUDGE → SPY loop (SPY runs after each JUDGE)
  * 2. If approved → HOST: commit + push
  * 3. Next story
- * 4. After ALL stories → Global scan all repositories
+ *
+ * Note: Global Scan runs as SEPARATE FINAL PHASE after Merge
  */
 
 import {
@@ -18,7 +18,6 @@ import {
   RepositoryInfo,
   DeveloperResultV2,
   StoryResultV2,
-  GlobalVulnerabilityScan,
   VulnerabilityV2,
 } from '../../types/index.js';
 import { openCodeClient } from '../../services/opencode/OpenCodeClient.js';
@@ -292,32 +291,6 @@ export async function executeDeveloperPhase(
   // Update session status
   await SessionRepository.updateStatus(sessionId, 'completed');
 
-  // === GLOBAL SCAN - After ALL stories complete ===
-  console.log(`[DeveloperPhase] Running GLOBAL vulnerability scan across all repositories...`);
-  const globalScan = await agentSpy.scanAllRepositories(
-    repositories.map(r => ({ name: r.name, localPath: r.localPath, type: r.type })),
-    { taskId: task.id, sessionId, phase: 'Developer' }
-  );
-
-  const globalVulnerabilities: GlobalVulnerabilityScan = {
-    scannedAt: globalScan.scannedAt,
-    totalFilesScanned: globalScan.totalFilesScanned,
-    repositoriesScanned: globalScan.repositoriesScanned,
-    vulnerabilities: globalScan.vulnerabilities as unknown as VulnerabilityV2[],
-    bySeverity: globalScan.bySeverity,
-    byType: globalScan.byType,
-    byRepository: globalScan.byRepository,
-  };
-
-  // Notify frontend about global scan
-  socketService.toTask(task.id, 'global_scan:complete', {
-    phase: 'Developer',
-    totalFiles: globalVulnerabilities.totalFilesScanned,
-    totalVulnerabilities: globalVulnerabilities.vulnerabilities.length,
-    bySeverity: globalVulnerabilities.bySeverity,
-    byRepository: globalVulnerabilities.byRepository,
-  });
-
   // Calculate overall success
   const allApproved = storyResultsV2.every(r => r.verdict === 'approved');
   const approvedCount = storyResultsV2.filter(r => r.verdict === 'approved').length;
@@ -337,24 +310,19 @@ export async function executeDeveloperPhase(
     totalCommits,
     approvedCount,
     totalStories: stories.length,
-    globalVulnerabilities: {
-      total: globalVulnerabilities.vulnerabilities.length,
-      bySeverity: globalVulnerabilities.bySeverity,
-    },
+    spyVulnerabilities: totalStoryVulns,
   });
 
   console.log(`\n[DeveloperPhase] Completed:`);
   console.log(`  - Stories approved: ${approvedCount}/${stories.length}`);
   console.log(`  - Total commits: ${totalCommits}`);
-  console.log(`  - Story vulnerabilities: ${totalStoryVulns}`);
-  console.log(`  - Global vulnerabilities: ${globalVulnerabilities.vulnerabilities.length}`);
+  console.log(`  - SPY vulnerabilities (across stories): ${totalStoryVulns}`);
 
   return {
     success: allApproved,
     sessionId,
     stories: storyResultsV2,
     totalCommits,
-    globalVulnerabilities,
   };
 }
 

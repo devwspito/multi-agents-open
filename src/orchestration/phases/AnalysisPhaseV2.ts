@@ -1,18 +1,18 @@
 /**
  * Analysis Phase V2
  *
- * New architecture with proper vulnerability structure:
- * - analysis.vulnerabilities: vulnerabilities found during analysis
- * - stories[]: each story has its own vulnerabilities array (empty until Developer phase)
- * - globalVulnerabilities: full scan of ALL repositories at end of phase
+ * Architecture:
+ * - analysis.vulnerabilities: SPY findings during analysis iterations
+ * - stories[]: each story has vulnerabilities (filled in Developer phase)
  *
  * Flow:
  * 1. HOST: Create branch task/{taskId}
  * 2. Create OpenCode session (with allow-all permissions)
- * 3. ANALYST → JUDGE → SPY loop
+ * 3. ANALYST → JUDGE → SPY loop (SPY runs after each JUDGE)
  * 4. If approved → save analysis
- * 5. Global scan ALL repositories
- * 6. HOST: Commit + Push
+ * 5. HOST: Commit + Push
+ *
+ * Note: Global Scan runs as SEPARATE FINAL PHASE after Merge
  */
 
 import {
@@ -22,7 +22,6 @@ import {
   AnalysisResultV2,
   AnalysisDataV2,
   StoryResultV2,
-  GlobalVulnerabilityScan,
   VulnerabilityV2,
 } from '../../types/index.js';
 import { openCodeClient } from '../../services/opencode/OpenCodeClient.js';
@@ -353,34 +352,7 @@ export async function executeAnalysisPhase(
   // Update session status
   await SessionRepository.updateStatus(sessionId, 'completed');
 
-  // === STEP 6: GLOBAL SCAN - Scan ALL repositories ===
-  console.log(`[AnalysisPhase] Running GLOBAL vulnerability scan across all repositories...`);
-  const globalScan = await agentSpy.scanAllRepositories(
-    repositories.map(r => ({ name: r.name, localPath: r.localPath, type: r.type })),
-    { taskId: task.id, sessionId, phase: 'Analysis' }
-  );
-
-  // Cast to GlobalVulnerabilityScan
-  const globalVulnerabilities: GlobalVulnerabilityScan = {
-    scannedAt: globalScan.scannedAt,
-    totalFilesScanned: globalScan.totalFilesScanned,
-    repositoriesScanned: globalScan.repositoriesScanned,
-    vulnerabilities: globalScan.vulnerabilities as unknown as VulnerabilityV2[],
-    bySeverity: globalScan.bySeverity,
-    byType: globalScan.byType,
-    byRepository: globalScan.byRepository,
-  };
-
-  // Notify frontend about global scan
-  socketService.toTask(task.id, 'global_scan:complete', {
-    phase: 'Analysis',
-    totalFiles: globalVulnerabilities.totalFilesScanned,
-    totalVulnerabilities: globalVulnerabilities.vulnerabilities.length,
-    bySeverity: globalVulnerabilities.bySeverity,
-    byRepository: globalVulnerabilities.byRepository,
-  });
-
-  // === STEP 7: Save to database ===
+  // === STEP 6: Save to database ===
   if (approved && analysisData) {
     await TaskRepository.updateAfterAnalysis(task.id, {
       branchName,
@@ -421,16 +393,12 @@ export async function executeAnalysisPhase(
     branchName,
     analysis: analysisWithVulns,
     stories: storiesV2.map(s => ({ id: s.id, title: s.title, description: s.description })),
-    globalVulnerabilities: {
-      total: globalVulnerabilities.vulnerabilities.length,
-      bySeverity: globalVulnerabilities.bySeverity,
-    },
+    spyVulnerabilities: analysisVulnerabilities.length,
   });
 
   console.log(`\n[AnalysisPhase] Completed:`);
   console.log(`  - Stories: ${storiesV2.length}`);
-  console.log(`  - Analysis vulnerabilities: ${analysisVulnerabilities.length}`);
-  console.log(`  - Global vulnerabilities: ${globalVulnerabilities.vulnerabilities.length}`);
+  console.log(`  - SPY vulnerabilities: ${analysisVulnerabilities.length}`);
 
   return {
     success: approved,
@@ -438,7 +406,6 @@ export async function executeAnalysisPhase(
     analysis: analysisWithVulns,
     stories: storiesV2,
     branchName,
-    globalVulnerabilities,
   };
 }
 
@@ -456,15 +423,6 @@ function createErrorResult(error: string): AnalysisResultV2 {
     },
     stories: [],
     branchName: '',
-    globalVulnerabilities: {
-      scannedAt: new Date(),
-      totalFilesScanned: 0,
-      repositoriesScanned: [],
-      vulnerabilities: [],
-      bySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
-      byType: {},
-      byRepository: {},
-    },
     error,
   };
 }
