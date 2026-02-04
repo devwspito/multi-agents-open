@@ -7,6 +7,8 @@
  * This bridges the gap between:
  * - OpenCode SSE events (agent activity, tool calls, etc.)
  * - Frontend WebSocket (real-time UI updates)
+ *
+ * Fix #5: Now properly stops event loop when no active sessions
  */
 
 import { openCodeClient, OpenCodeEvent } from './OpenCodeClient.js';
@@ -21,6 +23,7 @@ interface TaskSession {
 class OpenCodeEventBridgeService {
   private activeSessions: Map<string, TaskSession> = new Map(); // sessionId -> task info
   private eventLoopRunning = false;
+  private shouldStopLoop = false;
 
   /**
    * Register a task's OpenCode session for event forwarding
@@ -32,10 +35,11 @@ class OpenCodeEventBridgeService {
       startedAt: new Date(),
     });
 
-    console.log(`[EventBridge] Registered session ${sessionId} for task ${taskId}`);
+    console.log(`[EventBridge] Registered session ${sessionId} for task ${taskId} (active: ${this.activeSessions.size})`);
 
     // Start event loop if not running
     if (!this.eventLoopRunning) {
+      this.shouldStopLoop = false;
       this.startEventLoop();
     }
   }
@@ -45,31 +49,51 @@ class OpenCodeEventBridgeService {
    */
   unregisterSession(sessionId: string): void {
     this.activeSessions.delete(sessionId);
-    console.log(`[EventBridge] Unregistered session ${sessionId}`);
+    console.log(`[EventBridge] Unregistered session ${sessionId} (remaining: ${this.activeSessions.size})`);
+
+    // Stop event loop if no more active sessions
+    if (this.activeSessions.size === 0) {
+      console.log('[EventBridge] No active sessions, signaling event loop to stop');
+      this.shouldStopLoop = true;
+    }
   }
 
   /**
    * Start listening to OpenCode events and forwarding to frontend
+   * Will automatically stop when shouldStopLoop is true and no sessions
    */
   private async startEventLoop(): Promise<void> {
     if (this.eventLoopRunning) return;
     this.eventLoopRunning = true;
+    this.shouldStopLoop = false;
 
     console.log('[EventBridge] Starting event loop...');
 
     try {
       console.log('[EventBridge] Subscribing to OpenCode events...');
       for await (const event of openCodeClient.subscribeToEvents()) {
-        console.log(`[EventBridge] >>> RAW EVENT: ${event.type}`);
+        // Check if we should stop
+        if (this.shouldStopLoop && this.activeSessions.size === 0) {
+          console.log('[EventBridge] Stopping event loop - no active sessions');
+          break;
+        }
+
         this.handleEvent(event);
       }
       console.log('[EventBridge] Event stream ended');
     } catch (error: any) {
-      console.error('[EventBridge] Event loop error:', error.message);
+      // Ignore abort errors when intentionally stopping
+      if (this.shouldStopLoop) {
+        console.log('[EventBridge] Event loop stopped intentionally');
+      } else {
+        console.error('[EventBridge] Event loop error:', error.message);
+      }
+    } finally {
       this.eventLoopRunning = false;
 
-      // Retry after delay if there are active sessions
-      if (this.activeSessions.size > 0) {
+      // Retry after delay if there are still active sessions and we didn't intentionally stop
+      if (this.activeSessions.size > 0 && !this.shouldStopLoop) {
+        console.log('[EventBridge] Reconnecting in 5s...');
         setTimeout(() => this.startEventLoop(), 5000);
       }
     }
@@ -79,23 +103,19 @@ class OpenCodeEventBridgeService {
    * Handle an OpenCode event and forward to frontend
    */
   private handleEvent(event: OpenCodeEvent): void {
-    // Log ALL events for debugging
-    console.log(`[EventBridge] Event received: ${event.type}`, JSON.stringify(event.properties || {}).slice(0, 200));
-
     const sessionId = event.properties?.sessionID;
     if (!sessionId) {
-      console.log(`[EventBridge] Event has no sessionID, skipping`);
+      // Skip events without sessionID (they're not for us)
       return;
     }
 
     const taskSession = this.activeSessions.get(sessionId);
     if (!taskSession) {
-      console.log(`[EventBridge] Session ${sessionId} not tracked, skipping`);
+      // Skip events for sessions we're not tracking
       return;
     }
 
     const { taskId } = taskSession;
-    console.log(`[EventBridge] Forwarding event ${event.type} to task ${taskId}`);
 
     // Transform OpenCode event to frontend-friendly format
     const frontendEvent = this.transformEvent(event, taskId);
@@ -335,10 +355,7 @@ class OpenCodeEventBridgeService {
         };
 
       default:
-        // Unknown event type - log but don't forward
-        if (process.env.NODE_ENV === 'development') {
-          console.log(`[EventBridge] Unhandled event type: ${type}`, properties);
-        }
+        // Unknown event type - don't log spam, just skip
         return null;
     }
   }
@@ -358,6 +375,15 @@ class OpenCodeEventBridgeService {
       if (session.taskId === taskId) return true;
     }
     return false;
+  }
+
+  /**
+   * Force stop the event loop (for shutdown)
+   */
+  stop(): void {
+    this.shouldStopLoop = true;
+    this.activeSessions.clear();
+    console.log('[EventBridge] Forced stop');
   }
 }
 

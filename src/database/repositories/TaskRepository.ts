@@ -8,6 +8,7 @@ import { db, generateId } from '../index.js';
 import { Task, TaskStatus } from '../../types/index.js';
 
 export interface CreateTaskParams {
+  userId: string;
   projectId?: string;
   repositoryId?: string;
   title: string;
@@ -31,14 +32,15 @@ export class TaskRepository {
     const status = params.status || 'pending';
 
     const stmt = db.prepare(`
-      INSERT INTO tasks (id, project_id, repository_id, title, description, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tasks (id, user_id, project_id, repository_id, title, description, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    stmt.run(id, params.projectId, params.repositoryId, params.title, params.description, status, now, now);
+    stmt.run(id, params.userId, params.projectId, params.repositoryId, params.title, params.description, status, now, now);
 
     return {
       id,
+      userId: params.userId,
       projectId: params.projectId,
       repositoryId: params.repositoryId,
       title: params.title,
@@ -183,9 +185,31 @@ export class TaskRepository {
     };
   }
 
+  /**
+   * Fix #4: Recover stale running tasks on server restart
+   * Marks tasks that were 'running' or 'paused' as 'interrupted'
+   * Should be called during server initialization
+   */
+  static recoverStaleTasks(): number {
+    const now = new Date().toISOString();
+    const stmt = db.prepare(`
+      UPDATE tasks
+      SET status = 'interrupted', updated_at = ?
+      WHERE status IN ('running', 'paused')
+    `);
+    const result = stmt.run(now);
+
+    if (result.changes > 0) {
+      console.log(`[TaskRepository] Recovered ${result.changes} stale task(s) from previous session`);
+    }
+
+    return result.changes;
+  }
+
   private static mapRow(row: any): Task {
     return {
       id: row.id,
+      userId: row.user_id,
       projectId: row.project_id,
       repositoryId: row.repository_id,
       title: row.title,

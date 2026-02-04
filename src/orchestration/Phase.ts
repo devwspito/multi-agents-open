@@ -61,6 +61,8 @@ export interface PhaseContext {
   repositories: RepositoryInfo[];
   previousResults: Map<string, PhaseResult>;
   variables: Map<string, any>;
+  /** Callback when a session is created - allows tracking sessionId */
+  onSessionCreated?: (sessionId: string, phaseName: string) => void;
 }
 
 /**
@@ -645,6 +647,9 @@ export abstract class BasePhase implements IPhase {
     });
 
     console.log(`[${this.name}] Created session: ${sessionId}`);
+
+    // Notify caller about the new session (for tracking purposes)
+    context.onSessionCreated?.(sessionId, this.name);
 
     // CRITICAL: Register session for event forwarding to frontend
     openCodeEventBridge.registerSession(task.id, sessionId);

@@ -94,6 +94,8 @@ class OrchestratorClass {
       onPhaseComplete?: (phaseName: string, result: PhaseResult) => void;
       onStoryStart?: (storyIndex: number, story: Story) => void;
       onStoryComplete?: (storyIndex: number, story: Story, result: StoryResult) => void;
+      /** Called when a phase creates an OpenCode session - use to track sessionId */
+      onSessionCreated?: (sessionId: string, phaseName: string) => void;
     } = {}
   ): Promise<OrchestrationResult> {
     const approvalMode = options.approvalMode || 'automatic';
@@ -135,6 +137,7 @@ class OrchestratorClass {
       repositories: options.repositories || [],
       previousResults: new Map(),
       variables: new Map(Object.entries(options.variables || {})),
+      onSessionCreated: options.onSessionCreated,
     };
 
     // Log repositories for debugging
@@ -531,6 +534,7 @@ class OrchestratorClass {
       repositories?: RepositoryInfo[];
       variables?: Record<string, any>;
       previousResults?: Map<string, PhaseResult>;
+      onSessionCreated?: (sessionId: string, phaseName: string) => void;
     } = {}
   ): Promise<PhaseResult> {
     const task = TaskRepository.findById(taskId);
@@ -548,6 +552,7 @@ class OrchestratorClass {
       repositories: options.repositories || [],
       previousResults: options.previousResults || new Map(),
       variables: new Map(Object.entries(options.variables || {})),
+      onSessionCreated: options.onSessionCreated,
     };
 
     return phase.execute(context);

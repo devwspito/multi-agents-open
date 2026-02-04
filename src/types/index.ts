@@ -14,7 +14,8 @@ export type TaskStatus =
   | 'paused'
   | 'completed'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  | 'interrupted';  // Server restarted while task was running
 
 /**
  * Story status for tracking progress

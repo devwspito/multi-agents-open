@@ -2,6 +2,8 @@
  * Database Layer for Open Multi-Agents
  *
  * SQLite database for:
+ * - User authentication & GitHub tokens
+ * - Projects & repositories
  * - Task orchestration state
  * - Agent execution tracking (for ML training)
  * - Turn-by-turn data capture
@@ -32,24 +34,115 @@ db.pragma('foreign_keys = ON');
  * Initialize all database tables
  */
 export function initializeDatabase(): void {
-  console.log('[Database] Initializing SQLite database...');
+  console.log('[Database] Initializing SQLite database at:', DB_PATH);
 
-  // Tasks table - orchestration state
+  // ============================================
+  // USERS TABLE
+  // ============================================
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      github_id TEXT UNIQUE NOT NULL,
+      username TEXT NOT NULL,
+      email TEXT,
+      avatar_url TEXT,
+      access_token TEXT NOT NULL,
+      refresh_token TEXT,
+      token_expiry TEXT,
+      default_api_key TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_users_github_id ON users(github_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
+
+  // ============================================
+  // OAUTH STATES TABLE (CSRF protection)
+  // ============================================
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS oauth_states (
+      id TEXT PRIMARY KEY,
+      state TEXT UNIQUE NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_oauth_states_state ON oauth_states(state)`);
+
+  // ============================================
+  // PROJECTS TABLE
+  // ============================================
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      type TEXT DEFAULT 'web-app',
+      status TEXT DEFAULT 'planning',
+      user_id TEXT NOT NULL,
+      api_key TEXT,
+      settings TEXT,
+      is_active INTEGER DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_projects_user_id ON projects(user_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_projects_is_active ON projects(is_active)`);
+
+  // ============================================
+  // REPOSITORIES TABLE (matches agents-software-arq)
+  // ============================================
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS repositories (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      project_id TEXT NOT NULL,
+      github_repo_url TEXT NOT NULL,
+      github_repo_name TEXT NOT NULL,
+      github_branch TEXT DEFAULT 'main',
+      type TEXT NOT NULL,
+      path_patterns TEXT,
+      execution_order INTEGER,
+      dependencies TEXT,
+      env_variables TEXT,
+      is_active INTEGER DEFAULT 1,
+      last_synced_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_repositories_project_id ON repositories(project_id)`);
+
+  // ============================================
+  // TASKS TABLE
+  // ============================================
   db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
-      project_id TEXT,
-      repository_id TEXT,
       title TEXT NOT NULL,
       description TEXT,
+      user_id TEXT NOT NULL,
+      project_id TEXT,
+      repository_id TEXT,
       status TEXT DEFAULT 'pending',
       orchestration TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
     )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`);
 
-  // Agent Executions - for ML training
+  // ============================================
+  // AGENT EXECUTIONS TABLE (ML Training)
+  // ============================================
   db.exec(`
     CREATE TABLE IF NOT EXISTS agent_executions (
       id TEXT PRIMARY KEY,
@@ -69,11 +162,14 @@ export function initializeDatabase(): void {
       error_type TEXT,
       started_at TEXT DEFAULT CURRENT_TIMESTAMP,
       completed_at TEXT,
-      FOREIGN KEY (task_id) REFERENCES tasks(id)
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
     )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_executions_task ON agent_executions(task_id)`);
 
-  // Agent Turns - turn-by-turn tracking
+  // ============================================
+  // AGENT TURNS TABLE (ML Training)
+  // ============================================
   db.exec(`
     CREATE TABLE IF NOT EXISTS agent_turns (
       id TEXT PRIMARY KEY,
@@ -88,12 +184,16 @@ export function initializeDatabase(): void {
       output_tokens INTEGER DEFAULT 0,
       started_at TEXT DEFAULT CURRENT_TIMESTAMP,
       completed_at TEXT,
-      FOREIGN KEY (execution_id) REFERENCES agent_executions(id),
-      FOREIGN KEY (task_id) REFERENCES tasks(id)
+      FOREIGN KEY (execution_id) REFERENCES agent_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
     )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_turns_execution ON agent_turns(execution_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_turns_task ON agent_turns(task_id)`);
 
-  // Tool Calls - granular tool tracking
+  // ============================================
+  // TOOL CALLS TABLE (ML Training)
+  // ============================================
   db.exec(`
     CREATE TABLE IF NOT EXISTS tool_calls (
       id TEXT PRIMARY KEY,
@@ -114,23 +214,18 @@ export function initializeDatabase(): void {
       call_order INTEGER DEFAULT 0,
       started_at TEXT DEFAULT CURRENT_TIMESTAMP,
       completed_at TEXT,
-      FOREIGN KEY (execution_id) REFERENCES agent_executions(id),
-      FOREIGN KEY (turn_id) REFERENCES agent_turns(id),
-      FOREIGN KEY (task_id) REFERENCES tasks(id)
+      FOREIGN KEY (execution_id) REFERENCES agent_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_id) REFERENCES agent_turns(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
     )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_toolcalls_execution ON tool_calls(execution_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_toolcalls_turn ON tool_calls(turn_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_toolcalls_task ON tool_calls(task_id)`);
 
-  // Create indexes for performance
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_executions_task ON agent_executions(task_id);
-    CREATE INDEX IF NOT EXISTS idx_turns_execution ON agent_turns(execution_id);
-    CREATE INDEX IF NOT EXISTS idx_turns_task ON agent_turns(task_id);
-    CREATE INDEX IF NOT EXISTS idx_toolcalls_execution ON tool_calls(execution_id);
-    CREATE INDEX IF NOT EXISTS idx_toolcalls_turn ON tool_calls(turn_id);
-    CREATE INDEX IF NOT EXISTS idx_toolcalls_task ON tool_calls(task_id);
-  `);
-
-  // ML Security Signals - behavioral data for ML training
+  // ============================================
+  // ML SECURITY SIGNALS TABLE
+  // ============================================
   db.exec(`
     CREATE TABLE IF NOT EXISTS ml_security_signals (
       id TEXT PRIMARY KEY,
@@ -141,25 +236,87 @@ export function initializeDatabase(): void {
       description TEXT NOT NULL,
       details TEXT DEFAULT '{}',
       detected_at TEXT NOT NULL,
-      FOREIGN KEY (task_id) REFERENCES tasks(id),
-      FOREIGN KEY (execution_id) REFERENCES agent_executions(id)
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY (execution_id) REFERENCES agent_executions(id) ON DELETE SET NULL
     )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ml_signals_task ON ml_security_signals(task_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ml_signals_execution ON ml_security_signals(execution_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_ml_signals_type ON ml_security_signals(signal_type)`);
 
+  // ============================================
+  // SENTINENTAL TRAINING DATA TABLE (UNIFIED)
+  // ============================================
+  // Single source of truth for Sentinental Core ML training
+  // Stores PLATINO TRACE records locally before HTTP export
+  // Includes: Vulnerabilities + ExecutionContext + ProjectContext + CVSSLike + TaskHistory
   db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_ml_signals_task ON ml_security_signals(task_id);
-    CREATE INDEX IF NOT EXISTS idx_ml_signals_execution ON ml_security_signals(execution_id);
-    CREATE INDEX IF NOT EXISTS idx_ml_signals_type ON ml_security_signals(signal_type);
+    CREATE TABLE IF NOT EXISTS sentinental_training_data (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      phase TEXT NOT NULL,
+
+      -- Schema & Source
+      schema_version TEXT DEFAULT '3.0',
+      source TEXT DEFAULT 'open-multi-agents',
+      trace_level TEXT DEFAULT 'bronze',
+      agent_type TEXT,
+      model_id TEXT,
+
+      -- Vulnerabilities (JSON array with OWASP/CWE enrichment)
+      vulnerabilities TEXT NOT NULL DEFAULT '[]',
+      vulnerabilities_count INTEGER DEFAULT 0,
+
+      -- Execution Context (JSON)
+      execution_context TEXT NOT NULL DEFAULT '{}',
+
+      -- PLATINO TRACE Fields (JSON)
+      project_context TEXT,
+      code_context TEXT,
+      cvss_like TEXT,
+      task_history TEXT,
+
+      -- Summary Statistics
+      summary TEXT NOT NULL DEFAULT '{}',
+      risk_score INTEGER DEFAULT 0,
+      avg_cvss_score REAL,
+      blocked_count INTEGER DEFAULT 0,
+
+      -- Export State
+      sent_to_sentinental INTEGER DEFAULT 0,
+      sent_at TEXT,
+      send_attempts INTEGER DEFAULT 0,
+      last_error TEXT,
+
+      -- Timestamps
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sentinental_task ON sentinental_training_data(task_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sentinental_session ON sentinental_training_data(session_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sentinental_phase ON sentinental_training_data(phase)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sentinental_sent ON sentinental_training_data(sent_to_sentinental)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sentinental_risk ON sentinental_training_data(risk_score)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sentinental_trace ON sentinental_training_data(trace_level)`);
 
   console.log('[Database] SQLite initialized successfully');
 }
 
 /**
  * Connect to database (initialize if needed)
+ * Also recovers stale tasks from previous sessions
  */
 export async function connectDatabase(): Promise<void> {
   initializeDatabase();
+
+  // Fix #4: Recover tasks that were running when server stopped
+  // Import dynamically to avoid circular dependencies
+  const { TaskRepository } = await import('./repositories/TaskRepository.js');
+  TaskRepository.recoverStaleTasks();
 }
 
 /**
@@ -170,9 +327,29 @@ export function closeDatabase(): void {
   console.log('[Database] Connection closed');
 }
 
-// Generate unique IDs
+/**
+ * Clean up expired OAuth states (older than 10 minutes)
+ */
+export function cleanupExpiredOAuthStates(): void {
+  const stmt = db.prepare(`
+    DELETE FROM oauth_states
+    WHERE datetime(created_at) < datetime('now', '-10 minutes')
+  `);
+  stmt.run();
+}
+
+/**
+ * Generate unique IDs
+ */
 export function generateId(): string {
   return `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 10)}`;
+}
+
+/**
+ * Get current timestamp in ISO format
+ */
+export function now(): string {
+  return new Date().toISOString();
 }
 
 export { db };

@@ -234,10 +234,19 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
     await openCodeClient.connect();
   }
 
-  // Track execution (sessionId will be updated by phases)
+  // Validate pipeline exists BEFORE starting (Fix #2: avoid race condition)
+  const pipelineName = project.settings?.defaultPipeline || 'full';
+  const pipelineExists = orchestrator.getPipeline(pipelineName);
+  if (!pipelineExists) {
+    return res.status(400).json({
+      error: `Pipeline '${pipelineName}' not found. Available: ${orchestrator.getAllPipelines().map(p => p.name).join(', ') || 'none'}`,
+    });
+  }
+
+  // Track execution (sessionId will be updated by phases via callback)
   const execution: TaskExecution = {
     taskId: task.id,
-    sessionId: '', // Will be set by phases
+    sessionId: '', // Will be set by onSessionCreated callback
     status: 'running',
     startedAt: new Date(),
   };
@@ -250,28 +259,46 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
   socketService.toTask(task.id, 'task:started', { taskId: task.id });
 
   // Run orchestration in background
-  const pipeline = project.settings?.defaultPipeline || 'full';
   const approvalMode = project.settings?.approvalMode || 'manual';
 
-  orchestrator.execute(task.id, pipeline, {
+  orchestrator.execute(task.id, pipelineName, {
     projectPath: workspacePath,
     repositories,
     approvalMode: approvalMode as ApprovalMode,
+    // Fix #1: Capture sessionId from phases
+    onSessionCreated: (sessionId, phaseName) => {
+      console.log(`[Tasks] Session created for phase ${phaseName}: ${sessionId}`);
+      execution.sessionId = sessionId; // Update with latest session
+    },
     onPhaseStart: (phase) => {
       execution.currentPhase = phase;
     },
     onPhaseComplete: async (phase, result) => {
-      // Commit changes after development phases - commit to ALL repos
+      // Fix #3: Only commit repos that have actual changes
       if (['Development', 'Fixer'].includes(phase) && githubToken && repositories.length > 0) {
+        const filesModified: string[] = result.output?.filesModified || [];
+
         for (const repo of repositories) {
+          // Check if any modified files belong to this repo
+          const repoHasChanges = filesModified.some(f => f.startsWith(repo.localPath));
+
+          if (!repoHasChanges) {
+            console.log(`[Tasks] Skipping commit for ${repo.name} - no changes`);
+            continue;
+          }
+
           try {
             await WorkspaceService.commitAndPush(
               repo.localPath,
               `[${phase}] ${task.title}`,
               githubToken
             );
+            console.log(`[Tasks] Committed changes to ${repo.name}`);
           } catch (err: any) {
-            console.warn(`[Tasks] Commit to ${repo.name} failed: ${err.message}`);
+            // Only warn if it's not a "nothing to commit" error
+            if (!err.message.includes('nothing to commit')) {
+              console.warn(`[Tasks] Commit to ${repo.name} failed: ${err.message}`);
+            }
           }
         }
       }
@@ -280,12 +307,10 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
     execution.status = result.success ? 'completed' : 'failed';
     TaskRepository.updateStatus(task.id, result.success ? 'completed' : 'failed');
     socketService.toTask(task.id, 'task:complete', { taskId: task.id, result });
-    // Note: Phase.ts handles session unregistration
   }).catch(error => {
     execution.status = 'failed';
     TaskRepository.updateStatus(task.id, 'failed');
     socketService.toTask(task.id, 'task:error', { taskId: task.id, error: error.message });
-    // Note: Phase.ts handles session unregistration
   });
 
   res.json({ data: { taskId: task.id, status: 'running' } });
