@@ -215,33 +215,25 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
     }
   }
 
-  // Connect to OpenCode
+  // Connect to OpenCode (phases will create their own sessions)
   if (!openCodeClient.isConnected()) {
     await openCodeClient.connect();
   }
 
-  // Create OpenCode session
-  const sessionId = await openCodeClient.createSession({
-    title: `Task: ${task.title}`,
-  });
-
-  // Track execution
+  // Track execution (sessionId will be updated by phases)
   const execution: TaskExecution = {
     taskId: task.id,
-    sessionId,
+    sessionId: '', // Will be set by phases
     status: 'running',
     startedAt: new Date(),
   };
   executions.set(task.id, execution);
 
-  // Register session with event bridge for real-time activity forwarding
-  openCodeEventBridge.registerSession(task.id, sessionId);
-
   // Update task status
   TaskRepository.updateStatus(task.id, 'running');
 
   // Emit to frontend
-  socketService.toTask(task.id, 'task:started', { taskId: task.id, sessionId });
+  socketService.toTask(task.id, 'task:started', { taskId: task.id });
 
   // Run orchestration in background
   const pipeline = project.settings?.defaultPipeline || 'full';
@@ -274,17 +266,15 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
     execution.status = result.success ? 'completed' : 'failed';
     TaskRepository.updateStatus(task.id, result.success ? 'completed' : 'failed');
     socketService.toTask(task.id, 'task:complete', { taskId: task.id, result });
-    // Unregister from event bridge
-    openCodeEventBridge.unregisterSession(sessionId);
+    // Note: Phase.ts handles session unregistration
   }).catch(error => {
     execution.status = 'failed';
     TaskRepository.updateStatus(task.id, 'failed');
     socketService.toTask(task.id, 'task:error', { taskId: task.id, error: error.message });
-    // Unregister from event bridge
-    openCodeEventBridge.unregisterSession(sessionId);
+    // Note: Phase.ts handles session unregistration
   });
 
-  res.json({ data: { taskId: task.id, sessionId, status: 'running' } });
+  res.json({ data: { taskId: task.id, status: 'running' } });
 });
 
 /**
@@ -356,12 +346,16 @@ router.post('/:taskId/cancel', async (req: Request, res: Response) => {
     return res.status(404).json({ error: 'No execution found' });
   }
 
-  // Unregister from event bridge first
-  openCodeEventBridge.unregisterSession(execution.sessionId);
-
-  // Abort and delete OpenCode session
-  await openCodeClient.abortSession(execution.sessionId);
-  await openCodeClient.deleteSession(execution.sessionId);
+  // Unregister and abort session if we have one
+  if (execution.sessionId) {
+    openCodeEventBridge.unregisterSession(execution.sessionId);
+    try {
+      await openCodeClient.abortSession(execution.sessionId);
+      await openCodeClient.deleteSession(execution.sessionId);
+    } catch (err: any) {
+      console.warn(`[Tasks] Failed to abort session: ${err.message}`);
+    }
+  }
 
   execution.status = 'failed';
   executions.delete(req.params.taskId);
