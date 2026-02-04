@@ -1,44 +1,39 @@
 /**
  * Analysis Phase V2
  *
- * New architecture:
- * - Creates ONE OpenCode session for the entire phase
- * - ANALYST → JUDGE loop within same session
- * - HOST creates branch before starting
- * - Final analysis becomes branch description
+ * New architecture with proper vulnerability structure:
+ * - analysis.vulnerabilities: vulnerabilities found during analysis
+ * - stories[]: each story has its own vulnerabilities array (empty until Developer phase)
+ * - globalVulnerabilities: full scan of ALL repositories at end of phase
  *
  * Flow:
  * 1. HOST: Create branch task/{taskId}
  * 2. Create OpenCode session (with allow-all permissions)
- * 3. Send ANALYST prompt → wait for idle
- * 4. Send JUDGE prompt → wait for idle
- * 5. If rejected → send FIX prompt → back to JUDGE
- * 6. If approved → save analysis as branch description
- * 7. HOST: Commit + Push
+ * 3. ANALYST → JUDGE → SPY loop
+ * 4. If approved → save analysis
+ * 5. Global scan ALL repositories
+ * 6. HOST: Commit + Push
  */
 
-import { Task, Story, RepositoryInfo } from '../../types/index.js';
+import {
+  Task,
+  Story,
+  RepositoryInfo,
+  AnalysisResultV2,
+  AnalysisDataV2,
+  StoryResultV2,
+  GlobalVulnerabilityScan,
+  VulnerabilityV2,
+} from '../../types/index.js';
 import { openCodeClient } from '../../services/opencode/OpenCodeClient.js';
 import { gitService } from '../../services/git/index.js';
 import { SessionRepository } from '../../database/repositories/SessionRepository.js';
 import { TaskRepository } from '../../database/repositories/TaskRepository.js';
 import { socketService } from '../../services/realtime/index.js';
-import { agentSpy, Vulnerability } from '../../services/security/AgentSpy.js';
+import { agentSpy } from '../../services/security/AgentSpy.js';
 
-export interface AnalysisResult {
-  success: boolean;
-  sessionId: string;
-  analysis: {
-    summary: string;
-    approach: string;
-    risks: string[];
-  };
-  stories: Story[];
-  branchName: string;
-  /** Vulnerabilities detected by SPY (does not block) */
-  vulnerabilities: Vulnerability[];
-  error?: string;
-}
+// Re-export types for backward compatibility
+export type { AnalysisResultV2 as AnalysisResult };
 
 export interface AnalysisPhaseContext {
   task: Task;
@@ -155,7 +150,7 @@ Output the corrected JSON block with the same format as before.
  */
 export async function executeAnalysisPhase(
   context: AnalysisPhaseContext
-): Promise<AnalysisResult> {
+): Promise<AnalysisResultV2> {
   const { task, projectPath, repositories } = context;
   const autoApprove = context.autoApprove ?? false;
 
@@ -180,15 +175,7 @@ export async function executeAnalysisPhase(
     try {
       await gitService.checkout(workingDirectory, branchName);
     } catch {
-      return {
-        success: false,
-        sessionId: '',
-        analysis: { summary: '', approach: '', risks: [] },
-        stories: [],
-        branchName: '',
-        vulnerabilities: [],
-        error: `Failed to create/checkout branch: ${error.message}`,
-      };
+      return createErrorResult(`Failed to create/checkout branch: ${error.message}`);
     }
   }
 
@@ -203,7 +190,7 @@ export async function executeAnalysisPhase(
   const sessionId = await openCodeClient.createSession({
     title: `Analysis: ${task.title}`,
     directory: workingDirectory,
-    autoApprove: true, // Always allow-all for OpenCode tools
+    autoApprove: true,
   });
 
   console.log(`[AnalysisPhase] Session created: ${sessionId}`);
@@ -225,12 +212,10 @@ export async function executeAnalysisPhase(
   });
 
   // === STEP 3: ANALYST → JUDGE → SPY loop ===
-  // Track all vulnerabilities across iterations
-  const allVulnerabilities: Vulnerability[] = [];
-
-  // === ANALYST → JUDGE → SPY loop ===
-  let analysis: any = null;
-  let stories: Story[] = [];
+  // Track vulnerabilities found during analysis iterations
+  const analysisVulnerabilities: VulnerabilityV2[] = [];
+  let analysisData: { summary: string; approach: string; risks: string[] } | null = null;
+  let parsedStories: Story[] = [];
   let approved = false;
   let iterations = 0;
   const maxIterations = 3;
@@ -260,16 +245,16 @@ export async function executeAnalysisPhase(
     const parsedAnalysis = parseAnalysisJSON(analystOutput);
 
     if (parsedAnalysis) {
-      analysis = parsedAnalysis.analysis;
-      stories = parsedAnalysis.stories;
+      analysisData = parsedAnalysis.analysis;
+      parsedStories = parsedAnalysis.stories;
     }
 
     // Notify frontend
     socketService.toTask(task.id, 'iteration:complete', {
       type: 'analyst',
       iteration: iterations,
-      analysis,
-      stories: stories.map(s => ({ id: s.id, title: s.title })),
+      analysis: analysisData,
+      stories: parsedStories.map(s => ({ id: s.id, title: s.title })),
     });
 
     // --- JUDGE ---
@@ -307,7 +292,8 @@ export async function executeAnalysisPhase(
       phase: 'Analysis',
       iteration: iterations,
     });
-    allVulnerabilities.push(...spyVulns);
+    // Cast to VulnerabilityV2 (compatible types)
+    analysisVulnerabilities.push(...(spyVulns as unknown as VulnerabilityV2[]));
 
     // Notify frontend about SPY results
     socketService.toTask(task.id, 'iteration:complete', {
@@ -333,9 +319,7 @@ export async function executeAnalysisPhase(
         PROMPTS.fix(verdict.issues),
         { directory: workingDirectory }
       );
-      // Next iteration will wait for the fix and re-judge
     } else {
-      // No specific issues, can't improve further
       console.log(`[AnalysisPhase] No specific issues to fix, accepting as-is`);
       approved = true;
     }
@@ -346,8 +330,8 @@ export async function executeAnalysisPhase(
   }
 
   // === STEP 4: Save analysis as branch description ===
-  if (analysis) {
-    const description = `# ${task.title}\n\n## Summary\n${analysis.summary}\n\n## Approach\n${analysis.approach}\n\n## Risks\n${analysis.risks?.map((r: string) => `- ${r}`).join('\n') || 'None identified'}`;
+  if (analysisData) {
+    const description = `# ${task.title}\n\n## Summary\n${analysisData.summary}\n\n## Approach\n${analysisData.approach}\n\n## Risks\n${analysisData.risks?.map((r: string) => `- ${r}`).join('\n') || 'None identified'}`;
 
     try {
       await gitService.setBranchDescription(workingDirectory, description);
@@ -362,22 +346,72 @@ export async function executeAnalysisPhase(
     console.log(`[AnalysisPhase] Committing analysis changes...`);
     await gitService.commitAndPush(
       workingDirectory,
-      `[Analysis] ${task.title}\n\nGenerated ${stories.length} stories.`
+      `[Analysis] ${task.title}\n\nGenerated ${parsedStories.length} stories.`
     );
   }
 
   // Update session status
   await SessionRepository.updateStatus(sessionId, 'completed');
 
-  // === STEP 6: Save to database ===
-  if (approved && analysis) {
+  // === STEP 6: GLOBAL SCAN - Scan ALL repositories ===
+  console.log(`[AnalysisPhase] Running GLOBAL vulnerability scan across all repositories...`);
+  const globalScan = await agentSpy.scanAllRepositories(
+    repositories.map(r => ({ name: r.name, localPath: r.localPath, type: r.type })),
+    { taskId: task.id, sessionId, phase: 'Analysis' }
+  );
+
+  // Cast to GlobalVulnerabilityScan
+  const globalVulnerabilities: GlobalVulnerabilityScan = {
+    scannedAt: globalScan.scannedAt,
+    totalFilesScanned: globalScan.totalFilesScanned,
+    repositoriesScanned: globalScan.repositoriesScanned,
+    vulnerabilities: globalScan.vulnerabilities as unknown as VulnerabilityV2[],
+    bySeverity: globalScan.bySeverity,
+    byType: globalScan.byType,
+    byRepository: globalScan.byRepository,
+  };
+
+  // Notify frontend about global scan
+  socketService.toTask(task.id, 'global_scan:complete', {
+    phase: 'Analysis',
+    totalFiles: globalVulnerabilities.totalFilesScanned,
+    totalVulnerabilities: globalVulnerabilities.vulnerabilities.length,
+    bySeverity: globalVulnerabilities.bySeverity,
+    byRepository: globalVulnerabilities.byRepository,
+  });
+
+  // === STEP 7: Save to database ===
+  if (approved && analysisData) {
     await TaskRepository.updateAfterAnalysis(task.id, {
       branchName,
-      analysis,
-      stories,
+      analysis: analysisData,
+      stories: parsedStories,
     });
     console.log(`[AnalysisPhase] Saved analysis and stories to database`);
   }
+
+  // Build stories with V2 structure (vulnerabilities empty - will be filled in Developer phase)
+  const storiesV2: StoryResultV2[] = parsedStories.map(s => ({
+    id: s.id,
+    title: s.title,
+    description: s.description,
+    status: s.status,
+    filesToModify: s.filesToModify,
+    filesToCreate: s.filesToCreate,
+    filesToRead: s.filesToRead,
+    acceptanceCriteria: s.acceptanceCriteria,
+    iterations: 0,
+    verdict: 'needs_revision' as const,
+    vulnerabilities: [], // Empty - Developer phase will fill this
+  }));
+
+  // Build analysis with embedded vulnerabilities
+  const analysisWithVulns: AnalysisDataV2 = {
+    summary: analysisData?.summary || '',
+    approach: analysisData?.approach || '',
+    risks: analysisData?.risks || [],
+    vulnerabilities: analysisVulnerabilities,
+  };
 
   // Notify frontend
   socketService.toTask(task.id, 'phase:complete', {
@@ -385,30 +419,61 @@ export async function executeAnalysisPhase(
     success: approved,
     sessionId,
     branchName,
-    analysis,
-    stories: stories.map(s => ({ id: s.id, title: s.title, description: s.description })),
+    analysis: analysisWithVulns,
+    stories: storiesV2.map(s => ({ id: s.id, title: s.title, description: s.description })),
+    globalVulnerabilities: {
+      total: globalVulnerabilities.vulnerabilities.length,
+      bySeverity: globalVulnerabilities.bySeverity,
+    },
   });
 
-  console.log(`\n[AnalysisPhase] Completed: ${stories.length} stories created, ${allVulnerabilities.length} vulnerabilities detected`);
+  console.log(`\n[AnalysisPhase] Completed:`);
+  console.log(`  - Stories: ${storiesV2.length}`);
+  console.log(`  - Analysis vulnerabilities: ${analysisVulnerabilities.length}`);
+  console.log(`  - Global vulnerabilities: ${globalVulnerabilities.vulnerabilities.length}`);
 
   return {
     success: approved,
     sessionId,
-    analysis: analysis || { summary: '', approach: '', risks: [] },
-    stories,
+    analysis: analysisWithVulns,
+    stories: storiesV2,
     branchName,
-    vulnerabilities: allVulnerabilities,
+    globalVulnerabilities,
   };
 }
 
 // === Helper Functions ===
+
+function createErrorResult(error: string): AnalysisResultV2 {
+  return {
+    success: false,
+    sessionId: '',
+    analysis: {
+      summary: '',
+      approach: '',
+      risks: [],
+      vulnerabilities: [],
+    },
+    stories: [],
+    branchName: '',
+    globalVulnerabilities: {
+      scannedAt: new Date(),
+      totalFilesScanned: 0,
+      repositoriesScanned: [],
+      vulnerabilities: [],
+      bySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
+      byType: {},
+      byRepository: {},
+    },
+    error,
+  };
+}
 
 function determineWorkingDirectory(repositories: RepositoryInfo[], projectPath: string): string {
   if (!repositories || repositories.length === 0) {
     return projectPath;
   }
 
-  // Prefer backend repo
   const sorted = [...repositories].sort((a, b) => {
     if (a.type === 'backend' && b.type !== 'backend') return -1;
     if (b.type === 'backend' && a.type !== 'backend') return 1;
@@ -419,7 +484,6 @@ function determineWorkingDirectory(repositories: RepositoryInfo[], projectPath: 
 }
 
 function extractFinalOutput(events: any[]): string {
-  // Look for the last text output
   let output = '';
   for (const event of events) {
     if (event.type === 'message.part.updated') {

@@ -1449,6 +1449,135 @@ class AgentSpyService {
     const all = this.vulnerabilities.get(taskId) || [];
     return all.filter(v => v.phase === phase);
   }
+
+  // ============================================================================
+  // GLOBAL SCAN - Scans ALL repositories at once
+  // ============================================================================
+
+  /**
+   * Scan ALL repositories and return a GlobalVulnerabilityScan result
+   * Called at the end of each phase for comprehensive security analysis
+   *
+   * @param repositories - Array of repositories with their paths
+   * @param context - Task/session/phase context
+   * @returns GlobalVulnerabilityScan with vulnerabilities grouped by repo
+   */
+  async scanAllRepositories(
+    repositories: Array<{ name: string; localPath: string; type: string }>,
+    context: { taskId: string; sessionId: string; phase: string }
+  ): Promise<{
+    scannedAt: Date;
+    totalFilesScanned: number;
+    repositoriesScanned: Array<{
+      name: string;
+      path: string;
+      type: string;
+      filesScanned: number;
+      vulnerabilitiesFound: number;
+    }>;
+    vulnerabilities: Vulnerability[];
+    bySeverity: Record<VulnerabilitySeverity, number>;
+    byType: Record<string, number>;
+    byRepository: Record<string, number>;
+  }> {
+    console.log(`[AgentSpy] Starting global scan of ${repositories.length} repositories...`);
+
+    const scannedAt = new Date();
+    let totalFilesScanned = 0;
+    const allVulnerabilities: Vulnerability[] = [];
+    const repositoriesScanned: Array<{
+      name: string;
+      path: string;
+      type: string;
+      filesScanned: number;
+      vulnerabilitiesFound: number;
+    }> = [];
+
+    const bySeverity: Record<VulnerabilitySeverity, number> = {
+      low: 0,
+      medium: 0,
+      high: 0,
+      critical: 0,
+    };
+    const byType: Record<string, number> = {};
+    const byRepository: Record<string, number> = {};
+
+    for (const repo of repositories) {
+      console.log(`[AgentSpy] Scanning repository: ${repo.name} (${repo.type}) at ${repo.localPath}`);
+
+      // Scan this repository (workspacePath is the first param, context stays clean)
+      const repoVulns = await this.scanWorkspace(repo.localPath, context, {
+        maxFiles: 200, // More files for global scan
+      });
+
+      // Count files scanned (approximate from vulnerability count + base)
+      const filesInRepo = await this.countCodeFiles(repo.localPath);
+      totalFilesScanned += filesInRepo;
+
+      repositoriesScanned.push({
+        name: repo.name,
+        path: repo.localPath,
+        type: repo.type,
+        filesScanned: filesInRepo,
+        vulnerabilitiesFound: repoVulns.length,
+      });
+
+      // Tag vulnerabilities with repository name
+      for (const v of repoVulns) {
+        (v as any).repositoryName = repo.name;
+        (v as any).repositoryType = repo.type;
+        allVulnerabilities.push(v);
+
+        // Update summaries
+        bySeverity[v.severity]++;
+        byType[v.type] = (byType[v.type] || 0) + 1;
+        byRepository[repo.name] = (byRepository[repo.name] || 0) + 1;
+      }
+    }
+
+    console.log(`[AgentSpy] Global scan complete: ${totalFilesScanned} files, ${allVulnerabilities.length} vulnerabilities across ${repositories.length} repos`);
+
+    return {
+      scannedAt,
+      totalFilesScanned,
+      repositoriesScanned,
+      vulnerabilities: allVulnerabilities,
+      bySeverity,
+      byType,
+      byRepository,
+    };
+  }
+
+  /**
+   * Count code files in a directory (for metrics)
+   */
+  private async countCodeFiles(workspacePath: string): Promise<number> {
+    const files = await this.findCodeFiles(workspacePath, 500);
+    return files.length;
+  }
+
+  /**
+   * Create an empty GlobalVulnerabilityScan (for error cases)
+   */
+  static createEmptyGlobalScan(): {
+    scannedAt: Date;
+    totalFilesScanned: number;
+    repositoriesScanned: never[];
+    vulnerabilities: never[];
+    bySeverity: Record<VulnerabilitySeverity, number>;
+    byType: Record<string, number>;
+    byRepository: Record<string, number>;
+  } {
+    return {
+      scannedAt: new Date(),
+      totalFilesScanned: 0,
+      repositoriesScanned: [],
+      vulnerabilities: [],
+      bySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
+      byType: {},
+      byRepository: {},
+    };
+  }
 }
 
 export const agentSpy = new AgentSpyService();

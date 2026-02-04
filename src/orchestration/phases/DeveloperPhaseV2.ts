@@ -1,47 +1,34 @@
 /**
  * Developer Phase V2
  *
- * New architecture:
- * - Creates ONE OpenCode session for ALL stories
- * - DEV → JUDGE → FIX loop within same session per story
- * - HOST commits + pushes after each approved story
- * - User can send messages to session anytime
+ * New architecture with proper vulnerability structure:
+ * - stories[]: each story has its own vulnerabilities array
+ * - globalVulnerabilities: full scan of ALL repositories at end of phase
  *
  * Flow per story:
- * 1. Send DEV prompt → wait for idle
- * 2. Send JUDGE prompt → wait for idle
- * 3. If rejected → send FIX prompt → back to JUDGE
- * 4. If approved → HOST: commit + push
- * 5. Next story
+ * 1. DEV → JUDGE → SPY loop
+ * 2. If approved → HOST: commit + push
+ * 3. Next story
+ * 4. After ALL stories → Global scan all repositories
  */
 
-import { Task, Story, RepositoryInfo } from '../../types/index.js';
+import {
+  Task,
+  Story,
+  RepositoryInfo,
+  DeveloperResultV2,
+  StoryResultV2,
+  GlobalVulnerabilityScan,
+  VulnerabilityV2,
+} from '../../types/index.js';
 import { openCodeClient } from '../../services/opencode/OpenCodeClient.js';
 import { gitService } from '../../services/git/index.js';
 import { SessionRepository } from '../../database/repositories/SessionRepository.js';
 import { socketService } from '../../services/realtime/index.js';
-import { agentSpy, Vulnerability } from '../../services/security/AgentSpy.js';
+import { agentSpy } from '../../services/security/AgentSpy.js';
 
-export interface StoryResult {
-  storyId: string;
-  storyTitle: string;
-  success: boolean;
-  verdict: 'approved' | 'rejected' | 'needs_revision';
-  iterations: number;
-  commitHash?: string;
-  /** Vulnerabilities detected by SPY for this story */
-  vulnerabilities: Vulnerability[];
-}
-
-export interface DeveloperResult {
-  success: boolean;
-  sessionId: string;
-  storyResults: StoryResult[];
-  totalCommits: number;
-  /** All vulnerabilities across all stories */
-  allVulnerabilities: Vulnerability[];
-  error?: string;
-}
+// Re-export types for backward compatibility
+export type { DeveloperResultV2 as DeveloperResult, StoryResultV2 as StoryResult };
 
 export interface DeveloperPhaseContext {
   task: Task;
@@ -164,7 +151,7 @@ After fixing, output a summary of what was changed.
  */
 export async function executeDeveloperPhase(
   context: DeveloperPhaseContext
-): Promise<DeveloperResult> {
+): Promise<DeveloperResultV2> {
   const { task, projectPath, repositories, stories, branchName } = context;
   const autoApprove = context.autoApprove ?? false;
 
@@ -194,7 +181,7 @@ export async function executeDeveloperPhase(
   const sessionId = await openCodeClient.createSession({
     title: `Developer: ${task.title}`,
     directory: workingDirectory,
-    autoApprove: true, // Always allow-all for OpenCode tools
+    autoApprove: true,
   });
 
   console.log(`[DeveloperPhase] Session created: ${sessionId}`);
@@ -216,11 +203,12 @@ export async function executeDeveloperPhase(
   });
 
   // === Process each story ===
-  const storyResults: StoryResult[] = [];
+  const storyResultsV2: StoryResultV2[] = [];
   let totalCommits = 0;
 
   for (let i = 0; i < stories.length; i++) {
     const story = stories[i];
+    const startTime = Date.now();
 
     console.log(`\n${'─'.repeat(60)}`);
     console.log(`[DeveloperPhase] STORY ${i + 1}/${stories.length}: ${story.title}`);
@@ -245,10 +233,31 @@ export async function executeDeveloperPhase(
       autoApprove
     );
 
-    storyResults.push(result);
+    // Build V2 story result
+    const storyResultV2: StoryResultV2 = {
+      id: story.id,
+      title: story.title,
+      description: story.description,
+      status: result.verdict === 'approved' ? 'completed' : 'failed',
+      filesToModify: story.filesToModify,
+      filesToCreate: story.filesToCreate,
+      filesToRead: story.filesToRead,
+      acceptanceCriteria: story.acceptanceCriteria,
+      iterations: result.iterations,
+      verdict: result.verdict,
+      score: result.score,
+      issues: result.issues,
+      vulnerabilities: result.vulnerabilities as unknown as VulnerabilityV2[],
+      trace: {
+        startTime,
+        endTime: Date.now(),
+        toolCalls: result.toolCalls || 0,
+        turns: result.iterations,
+      },
+    };
 
     // Commit + Push if approved
-    if (result.success && result.verdict === 'approved') {
+    if (result.verdict === 'approved') {
       const hasChanges = await gitService.hasChanges(workingDirectory);
       if (hasChanges) {
         console.log(`[DeveloperPhase] Committing story ${story.id}...`);
@@ -257,21 +266,24 @@ export async function executeDeveloperPhase(
           `Implement: ${story.title}`,
           { storyId: story.id, storyTitle: story.title }
         );
-        result.commitHash = commit.hash;
+        storyResultV2.commitHash = commit.hash;
         totalCommits++;
         console.log(`[DeveloperPhase] Committed: ${commit.hash.substring(0, 7)}`);
       }
     }
+
+    storyResultsV2.push(storyResultV2);
 
     // Notify frontend
     socketService.toTask(task.id, 'story:complete', {
       storyIndex: i,
       storyId: story.id,
       storyTitle: story.title,
-      success: result.success,
+      success: result.verdict === 'approved',
       verdict: result.verdict,
       iterations: result.iterations,
-      commitHash: result.commitHash,
+      commitHash: storyResultV2.commitHash,
+      vulnerabilities: storyResultV2.vulnerabilities.length,
       totalStories: stories.length,
       completedStories: i + 1,
     });
@@ -280,37 +292,87 @@ export async function executeDeveloperPhase(
   // Update session status
   await SessionRepository.updateStatus(sessionId, 'completed');
 
+  // === GLOBAL SCAN - After ALL stories complete ===
+  console.log(`[DeveloperPhase] Running GLOBAL vulnerability scan across all repositories...`);
+  const globalScan = await agentSpy.scanAllRepositories(
+    repositories.map(r => ({ name: r.name, localPath: r.localPath, type: r.type })),
+    { taskId: task.id, sessionId, phase: 'Developer' }
+  );
+
+  const globalVulnerabilities: GlobalVulnerabilityScan = {
+    scannedAt: globalScan.scannedAt,
+    totalFilesScanned: globalScan.totalFilesScanned,
+    repositoriesScanned: globalScan.repositoriesScanned,
+    vulnerabilities: globalScan.vulnerabilities as unknown as VulnerabilityV2[],
+    bySeverity: globalScan.bySeverity,
+    byType: globalScan.byType,
+    byRepository: globalScan.byRepository,
+  };
+
+  // Notify frontend about global scan
+  socketService.toTask(task.id, 'global_scan:complete', {
+    phase: 'Developer',
+    totalFiles: globalVulnerabilities.totalFilesScanned,
+    totalVulnerabilities: globalVulnerabilities.vulnerabilities.length,
+    bySeverity: globalVulnerabilities.bySeverity,
+    byRepository: globalVulnerabilities.byRepository,
+  });
+
   // Calculate overall success
-  const allApproved = storyResults.every(r => r.verdict === 'approved');
-  const approvedCount = storyResults.filter(r => r.verdict === 'approved').length;
+  const allApproved = storyResultsV2.every(r => r.verdict === 'approved');
+  const approvedCount = storyResultsV2.filter(r => r.verdict === 'approved').length;
+  const totalStoryVulns = storyResultsV2.reduce((sum, s) => sum + s.vulnerabilities.length, 0);
 
   // Notify frontend
   socketService.toTask(task.id, 'phase:complete', {
     phase: 'Developer',
     success: allApproved,
     sessionId,
-    storyResults: storyResults.map(r => ({
-      storyId: r.storyId,
+    stories: storyResultsV2.map(r => ({
+      id: r.id,
       verdict: r.verdict,
       commitHash: r.commitHash,
+      vulnerabilities: r.vulnerabilities.length,
     })),
     totalCommits,
     approvedCount,
     totalStories: stories.length,
+    globalVulnerabilities: {
+      total: globalVulnerabilities.vulnerabilities.length,
+      bySeverity: globalVulnerabilities.bySeverity,
+    },
   });
 
-  // Collect all vulnerabilities from all stories
-  const allVulnerabilities = storyResults.flatMap(r => r.vulnerabilities || []);
-
-  console.log(`\n[DeveloperPhase] Completed: ${approvedCount}/${stories.length} stories approved, ${allVulnerabilities.length} total vulnerabilities`);
+  console.log(`\n[DeveloperPhase] Completed:`);
+  console.log(`  - Stories approved: ${approvedCount}/${stories.length}`);
+  console.log(`  - Total commits: ${totalCommits}`);
+  console.log(`  - Story vulnerabilities: ${totalStoryVulns}`);
+  console.log(`  - Global vulnerabilities: ${globalVulnerabilities.vulnerabilities.length}`);
 
   return {
     success: allApproved,
     sessionId,
-    storyResults,
+    stories: storyResultsV2,
     totalCommits,
-    allVulnerabilities,
+    globalVulnerabilities,
   };
+}
+
+/**
+ * Internal story execution result
+ */
+interface StoryExecutionResult {
+  verdict: 'approved' | 'rejected' | 'needs_revision';
+  iterations: number;
+  score?: number;
+  issues?: Array<{
+    severity: 'critical' | 'major' | 'minor';
+    file?: string;
+    description: string;
+    suggestion?: string;
+  }>;
+  vulnerabilities: VulnerabilityV2[];
+  toolCalls?: number;
 }
 
 /**
@@ -325,12 +387,15 @@ async function executeStory(
   workingDirectory: string,
   taskId: string,
   autoApprove: boolean
-): Promise<StoryResult> {
+): Promise<StoryExecutionResult> {
   let approved = false;
   let verdict: 'approved' | 'rejected' | 'needs_revision' = 'needs_revision';
+  let score = 0;
+  let issues: any[] = [];
   let iterations = 0;
   const maxIterations = 3;
-  const storyVulnerabilities: Vulnerability[] = [];
+  const storyVulnerabilities: VulnerabilityV2[] = [];
+  let totalToolCalls = 0;
 
   while (!approved && iterations < maxIterations) {
     iterations++;
@@ -347,10 +412,11 @@ async function executeStory(
     }
 
     // Wait for completion
-    await openCodeClient.waitForIdle(sessionId, {
+    const devEvents = await openCodeClient.waitForIdle(sessionId, {
       directory: workingDirectory,
       timeout: 300000,
     });
+    totalToolCalls += countToolCalls(devEvents);
 
     // Notify frontend
     socketService.toTask(taskId, 'iteration:complete', {
@@ -371,12 +437,15 @@ async function executeStory(
       directory: workingDirectory,
       timeout: 120000,
     });
+    totalToolCalls += countToolCalls(judgeEvents);
 
     const judgeOutput = extractFinalOutput(judgeEvents);
     const judgeResult = parseJudgeVerdict(judgeOutput);
 
     verdict = judgeResult.verdict;
-    console.log(`[DeveloperPhase] Judge verdict: ${verdict} (score: ${judgeResult.score})`);
+    score = judgeResult.score;
+    issues = judgeResult.issues;
+    console.log(`[DeveloperPhase] Judge verdict: ${verdict} (score: ${score})`);
 
     // Notify frontend
     socketService.toTask(taskId, 'iteration:complete', {
@@ -384,8 +453,8 @@ async function executeStory(
       storyId: story.id,
       iteration: iterations,
       verdict,
-      score: judgeResult.score,
-      issues: judgeResult.issues?.length || 0,
+      score,
+      issues: issues.length,
     });
 
     // --- SPY (after JUDGE, never blocks) ---
@@ -399,7 +468,7 @@ async function executeStory(
     }, {
       filesToScan: [...(story.filesToModify || []), ...(story.filesToCreate || [])],
     });
-    storyVulnerabilities.push(...spyVulns);
+    storyVulnerabilities.push(...(spyVulns as unknown as VulnerabilityV2[]));
 
     // Notify frontend about SPY results
     socketService.toTask(taskId, 'iteration:complete', {
@@ -419,20 +488,17 @@ async function executeStory(
     if (verdict === 'approved') {
       approved = true;
     } else if (verdict === 'rejected') {
-      // Fundamental problem, stop trying
       console.log(`[DeveloperPhase] Story rejected - stopping iterations`);
       break;
-    } else if (judgeResult.issues && judgeResult.issues.length > 0) {
+    } else if (issues.length > 0) {
       // --- FIX ---
-      console.log(`[DeveloperPhase] Sending FIX prompt (${judgeResult.issues.length} issues)...`);
+      console.log(`[DeveloperPhase] Sending FIX prompt (${issues.length} issues)...`);
       await openCodeClient.sendPrompt(
         sessionId,
-        PROMPTS.fix(judgeResult.issues),
+        PROMPTS.fix(issues),
         { directory: workingDirectory }
       );
-      // Next iteration will wait for the fix and re-judge
     } else {
-      // No specific issues but not approved
       console.log(`[DeveloperPhase] No specific issues to fix, accepting as-is`);
       approved = true;
       verdict = 'approved';
@@ -440,12 +506,12 @@ async function executeStory(
   }
 
   return {
-    storyId: story.id,
-    storyTitle: story.title,
-    success: verdict === 'approved',
     verdict,
     iterations,
+    score,
+    issues,
     vulnerabilities: storyVulnerabilities,
+    toolCalls: totalToolCalls,
   };
 }
 
@@ -478,6 +544,10 @@ function extractFinalOutput(events: any[]): string {
   return output;
 }
 
+function countToolCalls(events: any[]): number {
+  return events.filter(e => e.type === 'tool.execute.before').length;
+}
+
 function parseJudgeVerdict(output: string): {
   verdict: 'approved' | 'needs_revision' | 'rejected';
   score: number;
@@ -505,7 +575,6 @@ function parseJudgeVerdict(output: string): {
 
 /**
  * Send a user message to the active developer session
- * This allows the user to intervene and chat with OpenCode
  */
 export async function sendUserMessage(
   taskId: string,

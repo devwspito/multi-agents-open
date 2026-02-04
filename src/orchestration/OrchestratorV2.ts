@@ -166,11 +166,11 @@ class OrchestratorV2Class {
       options.onDeveloperComplete?.(developerResult);
 
       // Track story completions
-      for (let i = 0; i < developerResult.storyResults.length; i++) {
-        const sr = developerResult.storyResults[i];
-        const story = analysisResult.stories.find(s => s.id === sr.storyId);
+      for (let i = 0; i < developerResult.stories.length; i++) {
+        const sr = developerResult.stories[i];
+        const story = analysisResult.stories.find(s => s.id === sr.id);
         if (story) {
-          options.onStoryComplete?.(i, story, sr.success);
+          options.onStoryComplete?.(i, story, sr.verdict === 'approved');
         }
       }
 
@@ -179,7 +179,7 @@ class OrchestratorV2Class {
         // Continue to merge even if some stories failed
       }
 
-      const approvedCount = developerResult.storyResults.filter(r => r.verdict === 'approved').length;
+      const approvedCount = developerResult.stories.filter(r => r.verdict === 'approved').length;
       console.log(`[OrchestratorV2] Developer complete: ${approvedCount}/${analysisResult.stories.length} stories approved`);
       console.log(`[OrchestratorV2] Total commits: ${developerResult.totalCommits}`);
 
@@ -267,7 +267,7 @@ class OrchestratorV2Class {
       developer: {
         sessionId: developerResult?.sessionId,
         commits: developerResult?.totalCommits,
-        approved: developerResult?.storyResults.filter(r => r.verdict === 'approved').length,
+        approved: developerResult?.stories.filter(r => r.verdict === 'approved').length,
       },
       merge: {
         prNumber: mergeResult?.pullRequest?.number,
@@ -287,7 +287,7 @@ class OrchestratorV2Class {
     console.log(`\n${'═'.repeat(70)}`);
     console.log(`[OrchestratorV2] Task ${success ? 'COMPLETED' : 'FAILED'}`);
     console.log(`  Duration: ${Math.round(duration / 1000)}s`);
-    console.log(`  Stories: ${developerResult?.storyResults.filter(r => r.verdict === 'approved').length}/${analysisResult?.stories.length}`);
+    console.log(`  Stories: ${developerResult?.stories.filter(r => r.verdict === 'approved').length}/${analysisResult?.stories.length}`);
     console.log(`  PR: ${mergeResult?.pullRequest?.url || 'N/A'}`);
     console.log(`${'═'.repeat(70)}\n`);
 
