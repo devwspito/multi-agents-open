@@ -11,7 +11,6 @@ import { createServer } from 'http';
 import { socketService } from '../services/realtime/index.js';
 import { approvalService } from '../services/realtime/index.js';
 import { ptyProxyService } from '../services/realtime/PTYProxyService.js';
-import { initializePipelines } from '../orchestration/index.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -67,9 +66,6 @@ export async function startServer(port = 3000): Promise<void> {
 
   // Initialize PTY Proxy (terminal streaming)
   ptyProxyService.init(httpServer);
-
-  // Initialize pipelines
-  initializePipelines();
 
   // Start listening
   httpServer.listen(port, () => {

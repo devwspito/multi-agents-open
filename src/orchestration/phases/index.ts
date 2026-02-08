@@ -1,7 +1,7 @@
 /**
  * Phase Exports
  *
- * V2 Phases (4-phase architecture):
+ * V2 4-Phase Architecture:
  * 1. AnalysisPhaseV2: ANALYST → JUDGE → SPY loop
  * 2. DeveloperPhaseV2: DEV → JUDGE → SPY loop per story
  * 3. MergePhaseV2: PR creation and merge
@@ -11,12 +11,8 @@
  * - analysis.vulnerabilities: SPY findings during analysis
  * - stories[].vulnerabilities: SPY findings per story
  * - globalScan: Final comprehensive scan of ALL repositories
- *
- * Legacy Phases (Deprecated):
- * - AnalysisPhase, DevelopmentPhase, JudgePhase, FixerPhase
  */
 
-// === V2 Phases (Recommended) ===
 export { executeAnalysisPhase } from './AnalysisPhaseV2.js';
 export type { AnalysisPhaseContext, AnalysisResult } from './AnalysisPhaseV2.js';
 
@@ -39,10 +35,3 @@ export type {
   VulnerabilityV2,
   OrchestrationResultV2,
 } from '../../types/index.js';
-
-// === Legacy Phases (Deprecated) ===
-export { AnalysisPhase } from './AnalysisPhase.js';
-export { DevelopmentPhase } from './DevelopmentPhase.js';
-export { JudgePhase } from './JudgePhase.js';
-export type { JudgeVerdict, JudgeOutput } from './JudgePhase.js';
-export { FixerPhase } from './FixerPhase.js';

@@ -2,7 +2,7 @@
  * Server Entry Point
  *
  * Starts the API server with all services.
- * Uses PostgreSQL + Redis for scalability.
+ * Uses PostgreSQL + Redis/BullMQ for scalability.
  */
 
 import 'dotenv/config';
@@ -13,20 +13,16 @@ import { openCodeClient } from './services/opencode/OpenCodeClient.js';
 import { postgresService } from './database/postgres/PostgresService.js';
 import { initializeSchema, recoverStaleTasks } from './database/postgres/schema.js';
 
-// Queue services (optional)
+// Queue services
 import { redisService } from './services/queue/RedisService.js';
 import { taskQueue } from './services/queue/TaskQueue.js';
 import { taskWorker } from './workers/TaskWorker.js';
-
-// Feature flags
-const USE_QUEUE = process.env.USE_QUEUE === 'true';
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
 
 async function main() {
   console.log('Starting Open Multi-Agents Server...');
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Mode: PostgreSQL + ${USE_QUEUE ? 'BullMQ Queue' : 'Direct Execution'}`);
 
   // =============================================
   // DATABASE INITIALIZATION (PostgreSQL)
@@ -40,13 +36,11 @@ async function main() {
   // =============================================
   // QUEUE INITIALIZATION (Redis + BullMQ)
   // =============================================
-  if (USE_QUEUE) {
-    console.log('[Queue] Connecting to Redis...');
-    await redisService.connect();
-    await taskQueue.initialize();
-    await taskWorker.initialize();
-    console.log(`[Queue] BullMQ ready (${process.env.WORKER_CONCURRENCY || 3} workers)`);
-  }
+  console.log('[Queue] Connecting to Redis...');
+  await redisService.connect();
+  await taskQueue.initialize();
+  await taskWorker.initialize();
+  console.log(`[Queue] BullMQ ready (${process.env.WORKER_CONCURRENCY || 3} workers)`);
 
   // Start OpenCode connection in background (auto-retry)
   openCodeClient.startBackgroundReconnect();
@@ -58,12 +52,10 @@ async function main() {
   const gracefulShutdown = async () => {
     console.log('\n[Server] Shutting down gracefully...');
 
-    if (USE_QUEUE) {
-      console.log('[Shutdown] Stopping workers...');
-      await taskWorker.shutdown();
-      await taskQueue.close();
-      await redisService.disconnect();
-    }
+    console.log('[Shutdown] Stopping workers...');
+    await taskWorker.shutdown();
+    await taskQueue.close();
+    await redisService.disconnect();
 
     await postgresService.close();
     openCodeClient.disconnect();

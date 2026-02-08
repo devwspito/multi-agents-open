@@ -12,7 +12,7 @@ import { getRepository } from './repositories.js';
 import { TaskRepository } from '../../database/repositories/TaskRepository.js';
 import { RepositoryRepository } from '../../database/repositories/RepositoryRepository.js';
 import { ProjectRepository } from '../../database/repositories/ProjectRepository.js';
-import { orchestrator, ApprovalMode } from '../../orchestration/index.js';
+import { orchestratorV2 } from '../../orchestration/index.js';
 import { openCodeClient, openCodeEventBridge } from '../../services/opencode/index.js';
 import { socketService, approvalService } from '../../services/realtime/index.js';
 import { costTracker } from '../../services/cost/index.js';
@@ -25,8 +25,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 
-// Check if queue mode is enabled
-const USE_QUEUE = process.env.USE_QUEUE !== 'false'; // Default to queue mode
+// Always use queue mode (V2 architecture)
 
 const router = Router();
 
@@ -270,14 +269,8 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
     await openCodeClient.connect();
   }
 
-  // Validate pipeline exists BEFORE starting (Fix #2: avoid race condition)
-  const pipelineName = project.settings?.defaultPipeline || 'full';
-  const pipelineExists = orchestrator.getPipeline(pipelineName);
-  if (!pipelineExists) {
-    return res.status(400).json({
-      error: `Pipeline '${pipelineName}' not found. Available: ${orchestrator.getAllPipelines().map(p => p.name).join(', ') || 'none'}`,
-    });
-  }
+  // V2 uses 4-phase architecture (no pipelines needed)
+  const pipelineName = 'v2'; // Legacy field kept for compatibility
 
   // Track execution (sessionId will be updated by phases via callback)
   const execution: TaskExecution = {
@@ -308,10 +301,8 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
   const approvalMode = project.settings?.approvalMode || 'manual';
   console.log(`[Tasks] 🔐 Task ${task.id} using approvalMode: ${approvalMode} (project.settings?.approvalMode: ${project.settings?.approvalMode || 'undefined'})`);
 
-  // Check if we should use queue mode or direct execution
-  if (USE_QUEUE) {
-    // === QUEUE MODE: Add task to BullMQ queue ===
-    const jobData: TaskJobData = {
+  // Add task to BullMQ queue (V2 architecture)
+  const jobData: TaskJobData = {
       taskId: task.id,
       userId,
       projectId: task.projectId!,
@@ -366,63 +357,6 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
       await TaskRepository.updateStatus(task.id, 'failed');
       return res.status(500).json({ error: `Failed to queue task: ${queueError.message}` });
     }
-
-  } else {
-    // === DIRECT MODE: Run orchestration in background (legacy) ===
-    orchestrator.execute(task.id, pipelineName, {
-      projectPath: workspacePath,
-      repositories,
-      approvalMode: approvalMode as ApprovalMode,
-      // Fix #1: Capture sessionId from phases
-      onSessionCreated: (sessionId, phaseName) => {
-        console.log(`[Tasks] Session created for phase ${phaseName}: ${sessionId}`);
-        execution.sessionId = sessionId; // Update with latest session
-      },
-      onPhaseStart: (phase) => {
-        execution.currentPhase = phase;
-      },
-      onPhaseComplete: async (phase, result) => {
-        // Fix #3: Only commit repos that have actual changes
-        if (['Development', 'Fixer'].includes(phase) && githubToken && repositories.length > 0) {
-          const filesModified: string[] = result.output?.filesModified || [];
-
-          for (const repo of repositories) {
-            // Check if any modified files belong to this repo
-            const repoHasChanges = filesModified.some(f => f.startsWith(repo.localPath));
-
-            if (!repoHasChanges) {
-              console.log(`[Tasks] Skipping commit for ${repo.name} - no changes`);
-              continue;
-            }
-
-            try {
-              await WorkspaceService.commitAndPush(
-                repo.localPath,
-                `[${phase}] ${task.title}`,
-                githubToken
-              );
-              console.log(`[Tasks] Committed changes to ${repo.name}`);
-            } catch (err: any) {
-              // Only warn if it's not a "nothing to commit" error
-              if (!err.message.includes('nothing to commit')) {
-                console.warn(`[Tasks] Commit to ${repo.name} failed: ${err.message}`);
-              }
-            }
-          }
-        }
-      },
-    }).then(async result => {
-      execution.status = result.success ? 'completed' : 'failed';
-      await TaskRepository.updateStatus(task.id, result.success ? 'completed' : 'failed');
-      socketService.toTask(task.id, 'task:complete', { taskId: task.id, result });
-    }).catch(async error => {
-      execution.status = 'failed';
-      await TaskRepository.updateStatus(task.id, 'failed');
-      socketService.toTask(task.id, 'task:error', { taskId: task.id, error: error.message });
-    });
-
-    res.json({ data: { taskId: task.id, status: 'running' } });
-  }
 });
 
 /**
@@ -520,17 +454,15 @@ router.post('/:taskId/continue', async (req: Request, res: Response) => {
 router.post('/:taskId/cancel', async (req: Request, res: Response) => {
   const taskId = req.params.taskId;
 
-  // Try to cancel from queue first
-  if (USE_QUEUE) {
-    const cancelled = await taskQueue.cancelTask(taskId);
-    if (cancelled) {
-      await TaskRepository.updateStatus(taskId, 'cancelled');
-      socketService.toTask(taskId, 'task:cancelled', { taskId, fromQueue: true });
-      return res.json({ data: { status: 'cancelled', fromQueue: true } });
-    }
+  // Try to cancel from queue
+  const cancelled = await taskQueue.cancelTask(taskId);
+  if (cancelled) {
+    await TaskRepository.updateStatus(taskId, 'cancelled');
+    socketService.toTask(taskId, 'task:cancelled', { taskId, fromQueue: true });
+    return res.json({ data: { status: 'cancelled', fromQueue: true } });
   }
 
-  // Fall back to direct execution cancellation
+  // Fall back to execution cancellation (if task is running)
   const execution = executions.get(taskId);
   if (!execution) {
     return res.status(404).json({ error: 'No execution found' });
@@ -1206,7 +1138,7 @@ router.get('/queue/stats', async (req: Request, res: Response) => {
       success: true,
       data: {
         ...stats,
-        mode: USE_QUEUE ? 'queue' : 'direct',
+        mode: 'queue',
       },
     });
   } catch (error: any) {

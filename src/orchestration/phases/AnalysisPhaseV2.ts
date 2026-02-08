@@ -360,10 +360,10 @@ export async function executeAnalysisPhase(
             assumptions: parsedQuestions.assumptionsIfSkipped,
             message: 'Please answer these questions to help guide the implementation, or skip to use default assumptions.',
           },
-          { timeout: 300000 } // 5 minute timeout for user to respond
+          300000 // 5 minute timeout for user to respond
         );
 
-        if (clarificationResponse.approved && clarificationResponse.feedback) {
+        if (clarificationResponse.action === 'approve' && clarificationResponse.feedback) {
           // User provided answers
           userClarifications = clarificationResponse.feedback;
           console.log(`[AnalysisPhase] Received user clarifications: ${userClarifications.substring(0, 100)}...`);

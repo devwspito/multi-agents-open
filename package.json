@@ -2,7 +2,7 @@
   "name": "open-multi-agents",
   "version": "1.0.0",
   "description": "Multi-Agent Development Platform with OpenCode + DGX Spark",
-  "main": "dist/index.js",
+  "main": "dist/server.js",
   "type": "module",
   "scripts": {
     "up": "./scripts/start.sh",

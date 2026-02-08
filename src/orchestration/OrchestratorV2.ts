@@ -23,7 +23,7 @@ import { socketService, approvalService } from '../services/realtime/index.js';
 import { cleanupTaskTracking } from './PhaseTracker.js';
 import { getProjectLLMConfig, getFullProjectLLMConfig } from '../api/routes/projects.js';
 import { openCodeClient } from '../services/opencode/OpenCodeClient.js';
-import { toOpenCodeProvider, hasPhaseOverrides, type PhaseType } from '../config/llmProviders.js';
+import { toOpenCodeProvider, hasPhaseOverrides, type PhaseType, type ProjectLLMConfig } from '../config/llmProviders.js';
 
 // Import V2 phases
 import {
@@ -124,7 +124,7 @@ class OrchestratorV2Class {
     await TaskRepository.updateStatus(taskId, 'running');
 
     // 🔥 Get project LLM configuration with per-phase support
-    const fullLLMConfig = task.projectId
+    const fullLLMConfig: ProjectLLMConfig = task.projectId
       ? await getFullProjectLLMConfig(task.projectId)
       : { default: { provider: 'local', model: 'kimi-dev-72b' } };
 
