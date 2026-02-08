@@ -2,10 +2,14 @@
  * Auth Routes
  *
  * GitHub OAuth + JWT token management.
+ * Uses PostgreSQL for persistence.
  */
 
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import { UserRepository } from '../../database/repositories/UserRepository.js';
+import { OAuthStateRepository } from '../../database/repositories/OAuthStateRepository.js';
 
 const router = Router();
 
@@ -14,54 +18,141 @@ const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
-interface User {
-  id: string;
-  email?: string;
-  name: string;
-  avatar?: string;
-  githubId?: string;
-  githubToken?: string;
-}
-
-// In-memory user store (replace with DB in production)
-const users = new Map<string, User>();
-const refreshTokens = new Map<string, string>(); // refreshToken -> userId
-
 /**
- * Generate tokens
+ * Generate JWT token
  */
-function generateTokens(user: User) {
-  const accessToken = jwt.sign(
-    { userId: user.id, email: user.email },
-    JWT_SECRET,
-    { expiresIn: '1h' }
-  );
-  const refreshToken = jwt.sign(
-    { userId: user.id, type: 'refresh' },
+function generateToken(userId: string, githubId: string): string {
+  return jwt.sign(
+    { userId, githubId },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
-  refreshTokens.set(refreshToken, user.id);
-  return { accessToken, refreshToken };
 }
 
 /**
  * GET /api/auth/github-auth/url
- * Get GitHub OAuth URL
+ * Get GitHub OAuth URL (redirects to backend callback)
  */
-router.get('/github-auth/url', (req: Request, res: Response) => {
-  const state = Math.random().toString(36).substring(7);
-  const redirectUri = `${FRONTEND_URL}/auth/callback`;
-  const scope = 'user:email,repo,read:org';
+router.get('/github-auth/url', async (req: Request, res: Response) => {
+  try {
+    const state = crypto.randomBytes(16).toString('hex');
 
-  const url = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scope}&state=${state}`;
+    // Save state to PostgreSQL
+    await OAuthStateRepository.create(state);
+    console.log(`[Auth] OAuth state created: ${state}`);
 
-  res.json({ url, state });
+    const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3001}`;
+    const redirectUri = `${backendUrl}/api/auth/github/callback`;
+    const scope = 'user:email,repo,read:org';
+
+    const url = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scope}&state=${state}`;
+
+    res.json({ success: true, url, state });
+  } catch (error) {
+    console.error('[Auth] Error generating GitHub auth URL:', error);
+    res.status(500).json({ success: false, message: 'Failed to generate auth URL' });
+  }
+});
+
+/**
+ * GET /api/auth/github/callback
+ * GitHub OAuth callback (GET from GitHub redirect)
+ */
+router.get('/github/callback', async (req: Request, res: Response) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.redirect(`${FRONTEND_URL}/auth/error?error=${error}`);
+  }
+
+  // Verify state from PostgreSQL
+  if (!state) {
+    console.error('[Auth] OAuth callback: missing state parameter');
+    return res.redirect(`${FRONTEND_URL}/auth/error?error=invalid_state`);
+  }
+
+  const isValidState = await OAuthStateRepository.verifyAndConsume(state as string);
+  if (!isValidState) {
+    console.error(`[Auth] OAuth callback: state not found or expired: ${state}`);
+    return res.redirect(`${FRONTEND_URL}/auth/error?error=invalid_state`);
+  }
+
+  console.log(`[Auth] OAuth state validated and consumed: ${state}`);
+
+  if (!code || typeof code !== 'string') {
+    return res.redirect(`${FRONTEND_URL}/auth/error?error=no_code`);
+  }
+
+  try {
+    // Exchange code for token
+    const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    });
+
+    const tokenData = await tokenResponse.json() as any;
+    if (tokenData.error) {
+      return res.redirect(`${FRONTEND_URL}/auth/error?error=${tokenData.error}`);
+    }
+
+    const githubToken = tokenData.access_token;
+
+    // Get user info from GitHub
+    const userResponse = await fetch('https://api.github.com/user', {
+      headers: { Authorization: `Bearer ${githubToken}` },
+    });
+    const githubUser = await userResponse.json() as any;
+
+    // Get email if not public
+    let email = githubUser.email;
+    if (!email) {
+      const emailsResponse = await fetch('https://api.github.com/user/emails', {
+        headers: {
+          Authorization: `Bearer ${githubToken}`,
+          Accept: 'application/json',
+        },
+      });
+      const emails: any = await emailsResponse.json();
+      const primaryEmail = emails.find((e: any) => e.primary);
+      email = primaryEmail?.email || emails[0]?.email;
+    }
+
+    // Create or update user in PostgreSQL
+    const user = await UserRepository.findOrCreate({
+      githubId: githubUser.id.toString(),
+      username: githubUser.login,
+      email,
+      avatarUrl: githubUser.avatar_url,
+      accessToken: githubToken,
+      refreshToken: tokenData.refresh_token,
+    });
+
+    // Generate JWT
+    const token = generateToken(user.id, user.githubId);
+
+    // Redirect to frontend with token
+    const params = new URLSearchParams({
+      token,
+      github: 'connected',
+    });
+    res.redirect(`${FRONTEND_URL}/?${params.toString()}`);
+  } catch (error: any) {
+    console.error('[Auth] GitHub callback error:', error);
+    res.redirect(`${FRONTEND_URL}/auth/error?error=server_error`);
+  }
 });
 
 /**
  * POST /api/auth/github/callback
- * Handle GitHub OAuth callback
+ * Handle GitHub OAuth callback (POST from frontend)
  */
 router.post('/github/callback', async (req: Request, res: Response) => {
   const { code } = req.body;
@@ -98,26 +189,29 @@ router.post('/github/callback', async (req: Request, res: Response) => {
     });
     const githubUser = await userResponse.json() as any;
 
-    // Create or update user
-    const userId = `github_${githubUser.id}`;
-    const user: User = {
-      id: userId,
-      email: githubUser.email,
-      name: githubUser.name || githubUser.login,
-      avatar: githubUser.avatar_url,
+    // Create or update user in PostgreSQL
+    const user = await UserRepository.findOrCreate({
       githubId: githubUser.id.toString(),
-      githubToken,
-    };
-    users.set(userId, user);
+      username: githubUser.login,
+      email: githubUser.email,
+      avatarUrl: githubUser.avatar_url,
+      accessToken: githubToken,
+      refreshToken: tokenData.refresh_token,
+    });
 
-    // Generate tokens
-    const tokens = generateTokens(user);
+    // Generate JWT
+    const token = generateToken(user.id, user.githubId);
 
     res.json({
+      success: true,
       data: {
-        accessToken: tokens.accessToken,
-        refreshToken: tokens.refreshToken,
-        user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar },
+        accessToken: token,
+        user: {
+          id: user.id,
+          name: user.username,
+          email: user.email,
+          avatar: user.avatarUrl,
+        },
       },
     });
   } catch (error: any) {
@@ -130,7 +224,7 @@ router.post('/github/callback', async (req: Request, res: Response) => {
  * GET /api/auth/me
  * Get current user
  */
-router.get('/me', (req: Request, res: Response) => {
+router.get('/me', async (req: Request, res: Response) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -139,14 +233,61 @@ router.get('/me', (req: Request, res: Response) => {
   try {
     const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, JWT_SECRET) as any;
-    const user = users.get(decoded.userId);
+
+    // Get user from PostgreSQL
+    const user = await UserRepository.findById(decoded.userId, true);
 
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
     }
 
     res.json({
-      data: { id: user.id, name: user.name, email: user.email, avatar: user.avatar },
+      success: true,
+      data: {
+        id: user.id,
+        githubId: user.githubId,
+        name: user.username,
+        username: user.username,
+        email: user.email,
+        avatar: user.avatarUrl,
+        avatarUrl: user.avatarUrl,
+        hasGithubConnected: !!user.accessToken,
+      },
+    });
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+/**
+ * GET /api/auth/me/api-key
+ * Get user's default API key
+ */
+router.get('/me/api-key', async (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET) as any;
+
+    const user = await UserRepository.findById(decoded.userId, true);
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    const apiKey = await UserRepository.getDecryptedApiKey(decoded.userId);
+    const maskedKey = apiKey ? `sk-ant-...${apiKey.slice(-4)}` : null;
+
+    res.json({
+      success: true,
+      data: {
+        hasApiKey: !!apiKey,
+        maskedKey,
+        provider: 'anthropic',
+      },
     });
   } catch {
     res.status(401).json({ error: 'Invalid token' });
@@ -155,9 +296,9 @@ router.get('/me', (req: Request, res: Response) => {
 
 /**
  * POST /api/auth/refresh
- * Refresh access token
+ * Refresh access token (JWT is self-contained, just verify and reissue)
  */
-router.post('/refresh', (req: Request, res: Response) => {
+router.post('/refresh', async (req: Request, res: Response) => {
   const { refreshToken } = req.body;
 
   if (!refreshToken) {
@@ -166,24 +307,14 @@ router.post('/refresh', (req: Request, res: Response) => {
 
   try {
     const decoded = jwt.verify(refreshToken, JWT_SECRET) as any;
-    const userId = refreshTokens.get(refreshToken);
 
-    if (!userId || decoded.userId !== userId) {
-      return res.status(401).json({ error: 'Invalid refresh token' });
-    }
-
-    const user = users.get(userId);
+    const user = await UserRepository.findById(decoded.userId);
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
     }
 
-    const accessToken = jwt.sign(
-      { userId: user.id, email: user.email },
-      JWT_SECRET,
-      { expiresIn: '1h' }
-    );
-
-    res.json({ data: { accessToken } });
+    const accessToken = generateToken(user.id, user.githubId);
+    res.json({ success: true, data: { accessToken } });
   } catch {
     res.status(401).json({ error: 'Invalid refresh token' });
   }
@@ -191,20 +322,18 @@ router.post('/refresh', (req: Request, res: Response) => {
 
 /**
  * POST /api/auth/logout
- * Logout and revoke refresh token
+ * Logout (JWT is stateless, just acknowledge)
  */
-router.post('/logout', (req: Request, res: Response) => {
-  const { refreshToken } = req.body;
-  if (refreshToken) {
-    refreshTokens.delete(refreshToken);
-  }
-  res.json({ success: true });
+router.post('/logout', (_req: Request, res: Response) => {
+  res.json({ success: true, message: 'Logged out successfully' });
 });
 
 export default router;
 
-// Export middleware for protected routes
-export function authMiddleware(req: Request, res: Response, next: Function) {
+/**
+ * Auth middleware for protected routes
+ */
+export async function authMiddleware(req: Request, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -213,15 +342,23 @@ export function authMiddleware(req: Request, res: Response, next: Function) {
   try {
     const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, JWT_SECRET) as any;
+
+    const user = await UserRepository.findById(decoded.userId, true);
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
     (req as any).userId = decoded.userId;
-    (req as any).user = users.get(decoded.userId);
+    (req as any).user = user;
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-// Export function to get user's GitHub token
-export function getUserGitHubToken(userId: string): string | undefined {
-  return users.get(userId)?.githubToken;
+/**
+ * Get user's GitHub access token
+ */
+export async function getUserGitHubToken(userId: string): Promise<string | undefined> {
+  return UserRepository.getAccessToken(userId);
 }

@@ -1,46 +1,284 @@
 /**
  * OpenCode Event Bridge
  *
- * Subscribes to OpenCode events and forwards them to the frontend
- * via WebSocket (socketService).
+ * Manages subscriptions to OpenCode events for multiple directories.
+ * Each directory with active sessions gets its own event subscription.
  *
  * This bridges the gap between:
  * - OpenCode SSE events (agent activity, tool calls, etc.)
  * - Frontend WebSocket (real-time UI updates)
- *
- * Fix #5: Now properly stops event loop when no active sessions
+ * - Phase execution (waitForIdle)
+ * - Training data tracking
  */
 
+import { EventEmitter } from 'events';
 import { openCodeClient, OpenCodeEvent } from './OpenCodeClient.js';
 import { socketService } from '../realtime/SocketService.js';
+import { TaskRepository } from '../../database/repositories/TaskRepository.js';
+import { costTracker } from '../cost/index.js';
 
 interface TaskSession {
   taskId: string;
   sessionId: string;
   startedAt: Date;
+  directory: string; // Working directory for event subscription
 }
 
-class OpenCodeEventBridgeService {
+interface DirectorySubscription {
+  directory: string;
+  running: boolean;
+  shouldStop: boolean;
+  sessionCount: number;
+}
+
+interface WaitForIdleOptions {
+  timeout?: number;
+  onEvent?: (event: OpenCodeEvent) => void;
+}
+
+class OpenCodeEventBridgeService extends EventEmitter {
   private activeSessions: Map<string, TaskSession> = new Map(); // sessionId -> task info
-  private eventLoopRunning = false;
-  private shouldStopLoop = false;
+  private directorySubscriptions: Map<string, DirectorySubscription> = new Map(); // directory -> subscription
+  private collectedEvents: Map<string, OpenCodeEvent[]> = new Map(); // sessionId -> events
+
+  // 🔥 Batching: Accumulate activity logs and flush periodically to reduce DB load
+  // Includes full tool input (old_string, new_string, file_path) for ML training
+  private pendingActivityLogs: Map<string, Array<{
+    type: string;
+    content: string;
+    tool?: string;
+    toolState?: string;
+    toolInput?: any;  // Full tool input for ML training
+    toolOutput?: any; // Tool result/output
+  }>> = new Map(); // taskId -> pending log entries
+  private flushTimer: NodeJS.Timeout | null = null;
+  private readonly FLUSH_INTERVAL_MS = 2000; // Flush every 2 seconds
+  private readonly MAX_BATCH_SIZE = 50; // Force flush if batch gets too large
+
+  constructor() {
+    super();
+    // Increase max listeners since multiple phases may listen concurrently
+    this.setMaxListeners(50);
+    // Start the flush timer
+    this.startFlushTimer();
+  }
+
+  /**
+   * Start the periodic flush timer for activity logs
+   */
+  private startFlushTimer(): void {
+    if (this.flushTimer) return;
+    this.flushTimer = setInterval(() => {
+      this.flushAllActivityLogs();
+    }, this.FLUSH_INTERVAL_MS);
+    console.log(`[EventBridge] Activity log flush timer started (interval: ${this.FLUSH_INTERVAL_MS}ms)`);
+  }
+
+  /**
+   * Stop the flush timer
+   */
+  private stopFlushTimer(): void {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+  }
+
+  /**
+   * Flush all pending activity logs to the database
+   */
+  private async flushAllActivityLogs(): Promise<void> {
+    if (this.pendingActivityLogs.size === 0) return;
+
+    const tasksToFlush = Array.from(this.pendingActivityLogs.entries());
+    this.pendingActivityLogs.clear();
+
+    // Flush each task's logs in parallel
+    const flushPromises = tasksToFlush.map(async ([taskId, entries]) => {
+      if (entries.length === 0) return;
+      try {
+        await TaskRepository.appendActivityLogs(taskId, entries);
+        console.log(`[EventBridge] Flushed ${entries.length} activity logs for task ${taskId}`);
+      } catch (err: any) {
+        console.warn(`[EventBridge] Failed to flush ${entries.length} activity logs for task ${taskId}: ${err.message}`);
+      }
+    });
+
+    await Promise.all(flushPromises);
+  }
+
+  /**
+   * Queue an activity log entry for batch saving
+   */
+  private queueActivityLog(taskId: string, entry: {
+    type: string;
+    content: string;
+    tool?: string;
+    toolState?: string;
+    toolInput?: any;  // Full tool input for ML training (old_string, new_string, file_path, etc.)
+    toolOutput?: any; // Tool result/output
+  }): void {
+    if (!this.pendingActivityLogs.has(taskId)) {
+      this.pendingActivityLogs.set(taskId, []);
+    }
+    const logs = this.pendingActivityLogs.get(taskId)!;
+    logs.push(entry);
+
+    // Force flush if batch is too large
+    if (logs.length >= this.MAX_BATCH_SIZE) {
+      console.log(`[EventBridge] Batch size limit reached for task ${taskId}, forcing flush`);
+      const entriesToFlush = [...logs];
+      this.pendingActivityLogs.set(taskId, []);
+      TaskRepository.appendActivityLogs(taskId, entriesToFlush).catch(err => {
+        console.warn(`[EventBridge] Failed to flush activity logs: ${err.message}`);
+      });
+    }
+  }
+
+  /**
+   * 🔥 ML TRAINING: Only save high-value events for training
+   *
+   * What's valuable:
+   * - Tool calls (edit, bash, write, read) when COMPLETED with full input/output
+   * - Questions asked/answered
+   *
+   * What's NOISE (skip):
+   * - Streaming content chunks
+   * - "thinking" / "running" status updates
+   * - Glob/grep (too many, low value)
+   * - Session lifecycle events
+   */
+  private saveForTrainingIfValuable(taskId: string, frontendEvent: { type: string; data: any }): void {
+    const { type, data } = frontendEvent;
+
+    // 🔥 HIGH VALUE: Tool calls - but ONLY completed ones for important tools
+    if (type === 'tool_call') {
+      const toolName = (data.tool || '').toLowerCase();
+      const toolState = data.state || data.status;
+
+      // Only valuable tools
+      const valuableTools = ['edit', 'bash', 'write', 'read'];
+      if (!valuableTools.includes(toolName)) {
+        return; // Skip glob, grep, todowrite, etc.
+      }
+
+      // Only completed (with results)
+      if (toolState !== 'completed' && toolState !== 'success') {
+        return; // Skip "running" states
+      }
+
+      // Must have meaningful input
+      if (!data.input) {
+        return;
+      }
+
+      // 🔥 Save with full tool data
+      this.queueActivityLog(taskId, {
+        type: 'tool_completed',
+        content: `${toolName}: ${this.summarizeToolInput(toolName, data.input)}`,
+        tool: toolName,
+        toolState: 'completed',
+        toolInput: data.input,
+        toolOutput: data.output || data.result,
+      });
+      return;
+    }
+
+    // 🔥 HIGH VALUE: Questions (agent asking for clarification)
+    if (type === 'question_asked') {
+      this.queueActivityLog(taskId, {
+        type: 'question',
+        content: data.question || '',
+        toolInput: { question: data.question, options: data.options },
+      });
+      return;
+    }
+
+    if (type === 'question_answered') {
+      this.queueActivityLog(taskId, {
+        type: 'answer',
+        content: data.answer || '',
+        toolOutput: { answer: data.answer },
+      });
+      return;
+    }
+
+    // 🔥 MEDIUM VALUE: Final agent message (non-streaming)
+    if ((type === 'agent_message' || type === 'agent_output') && data.streaming !== true) {
+      const content = data.content || '';
+      // Only save substantial messages (not just "OK" or status updates)
+      if (content.length > 50) {
+        this.queueActivityLog(taskId, {
+          type: 'agent_response',
+          content: content.substring(0, 2000), // Limit size
+        });
+      }
+      return;
+    }
+
+    // Everything else is NOISE - don't save
+    // - streaming chunks
+    // - thinking/progress
+    // - session lifecycle
+    // - glob/grep results
+  }
+
+  /**
+   * Summarize tool input for human-readable content field
+   */
+  private summarizeToolInput(toolName: string, input: any): string {
+    if (!input) return '';
+
+    switch (toolName) {
+      case 'edit':
+        return input.file_path || 'file';
+      case 'write':
+        return input.file_path || 'file';
+      case 'read':
+        return input.file_path || 'file';
+      case 'bash':
+        const cmd = input.command || '';
+        return cmd.substring(0, 80) + (cmd.length > 80 ? '...' : '');
+      default:
+        return JSON.stringify(input).substring(0, 50);
+    }
+  }
 
   /**
    * Register a task's OpenCode session for event forwarding
+   * @param directory - The working directory where the session was created (REQUIRED for event subscription)
    */
-  registerSession(taskId: string, sessionId: string): void {
+  registerSession(taskId: string, sessionId: string, directory: string): void {
+    if (!directory) {
+      console.error(`[EventBridge] Cannot register session without directory!`);
+      return;
+    }
+
     this.activeSessions.set(sessionId, {
       taskId,
       sessionId,
       startedAt: new Date(),
+      directory,
     });
 
-    console.log(`[EventBridge] Registered session ${sessionId} for task ${taskId} (active: ${this.activeSessions.size})`);
+    console.log(`[EventBridge] Registered session ${sessionId} for task ${taskId} (dir: ${directory}, active: ${this.activeSessions.size})`);
 
-    // Start event loop if not running
-    if (!this.eventLoopRunning) {
-      this.shouldStopLoop = false;
-      this.startEventLoop();
+    // Start event loop for this directory if not already running
+    const existingSub = this.directorySubscriptions.get(directory);
+    if (existingSub) {
+      existingSub.sessionCount++;
+      console.log(`[EventBridge] Directory ${directory} already subscribed (sessions: ${existingSub.sessionCount})`);
+    } else {
+      // Create new subscription for this directory
+      const sub: DirectorySubscription = {
+        directory,
+        running: false,
+        shouldStop: false,
+        sessionCount: 1,
+      };
+      this.directorySubscriptions.set(directory, sub);
+      console.log(`[EventBridge] Starting subscription for directory: ${directory}`);
+      this.startDirectoryEventLoop(directory, sub);
     }
   }
 
@@ -48,85 +286,158 @@ class OpenCodeEventBridgeService {
    * Unregister a session (task completed/cancelled)
    */
   unregisterSession(sessionId: string): void {
+    const session = this.activeSessions.get(sessionId);
+    if (!session) return;
+
+    const { directory } = session;
     this.activeSessions.delete(sessionId);
+
+    // Clean up collected events for this session
+    this.collectedEvents.delete(sessionId);
+
+    // Remove any lingering listeners for this session
+    this.removeAllListeners(`event:${sessionId}`);
+    this.removeAllListeners(`session:idle:${sessionId}`);
+    this.removeAllListeners(`session:error:${sessionId}`);
+
     console.log(`[EventBridge] Unregistered session ${sessionId} (remaining: ${this.activeSessions.size})`);
 
-    // Stop event loop if no more active sessions
-    if (this.activeSessions.size === 0) {
-      console.log('[EventBridge] No active sessions, signaling event loop to stop');
-      this.shouldStopLoop = true;
+    // Decrement directory subscription count
+    const sub = this.directorySubscriptions.get(directory);
+    if (sub) {
+      sub.sessionCount--;
+      if (sub.sessionCount <= 0) {
+        console.log(`[EventBridge] No more sessions for directory ${directory}, stopping subscription`);
+        sub.shouldStop = true;
+        this.directorySubscriptions.delete(directory);
+      }
     }
   }
 
   /**
-   * Start listening to OpenCode events and forwarding to frontend
-   * Will automatically stop when shouldStopLoop is true and no sessions
+   * Start listening to OpenCode events for a specific directory
    */
-  private async startEventLoop(): Promise<void> {
-    if (this.eventLoopRunning) return;
-    this.eventLoopRunning = true;
-    this.shouldStopLoop = false;
+  private async startDirectoryEventLoop(directory: string, sub: DirectorySubscription): Promise<void> {
+    if (sub.running) return;
+    sub.running = true;
+    sub.shouldStop = false;
 
-    console.log('[EventBridge] Starting event loop...');
+    console.log(`[EventBridge] Starting event loop for directory: ${directory}`);
 
     try {
-      console.log('[EventBridge] Subscribing to OpenCode events...');
-      for await (const event of openCodeClient.subscribeToEvents()) {
+      console.log(`[EventBridge] Subscribing to OpenCode events for: ${directory}`);
+      let eventCount = 0;
+
+      for await (const event of openCodeClient.subscribeToEvents(directory)) {
         // Check if we should stop
-        if (this.shouldStopLoop && this.activeSessions.size === 0) {
-          console.log('[EventBridge] Stopping event loop - no active sessions');
+        if (sub.shouldStop) {
+          console.log(`[EventBridge] Stopping event loop for ${directory}`);
           break;
         }
 
-        this.handleEvent(event);
+        eventCount++;
+        if (eventCount <= 10 || eventCount % 50 === 0) {
+          console.log(`[EventBridge][${directory}] Event #${eventCount}: ${event.type}`);
+        }
+
+        // Pass directory so we can match events without sessionID
+        this.handleEvent(event, directory);
       }
-      console.log('[EventBridge] Event stream ended');
+      console.log(`[EventBridge] Event stream ended for ${directory} after ${eventCount} events`);
     } catch (error: any) {
-      // Ignore abort errors when intentionally stopping
-      if (this.shouldStopLoop) {
-        console.log('[EventBridge] Event loop stopped intentionally');
+      if (sub.shouldStop) {
+        console.log(`[EventBridge] Event loop stopped intentionally for ${directory}`);
       } else {
-        console.error('[EventBridge] Event loop error:', error.message);
+        console.error(`[EventBridge] Event loop error for ${directory}:`, error.message);
       }
     } finally {
-      this.eventLoopRunning = false;
+      sub.running = false;
 
-      // Retry after delay if there are still active sessions and we didn't intentionally stop
-      if (this.activeSessions.size > 0 && !this.shouldStopLoop) {
-        console.log('[EventBridge] Reconnecting in 5s...');
-        setTimeout(() => this.startEventLoop(), 5000);
+      // Retry after delay if there are still sessions for this directory
+      if (sub.sessionCount > 0 && !sub.shouldStop) {
+        console.log(`[EventBridge] Reconnecting in 5s for ${directory}...`);
+        setTimeout(() => this.startDirectoryEventLoop(directory, sub), 5000);
       }
     }
   }
 
   /**
-   * Handle an OpenCode event and forward to frontend
+   * Handle an OpenCode event and forward to frontend + emit for listeners
+   * @param event - The OpenCode event
+   * @param directory - The directory this event came from (for matching sessions without sessionID)
    */
-  private handleEvent(event: OpenCodeEvent): void {
-    const sessionId = event.properties?.sessionID;
+  private handleEvent(event: OpenCodeEvent, directory: string): void {
+    // Try to get sessionID from event properties
+    let sessionId = event.properties?.sessionID || event.properties?.sessionId;
+
+    // If no sessionID in event, find session by directory
     if (!sessionId) {
-      // Skip events without sessionID (they're not for us)
+      // Find the session registered for this directory
+      for (const [sid, session] of this.activeSessions.entries()) {
+        if (session.directory === directory) {
+          sessionId = sid;
+          break;
+        }
+      }
+    }
+
+    // Skip if still no session found (truly global events)
+    if (!sessionId) {
       return;
     }
 
     const taskSession = this.activeSessions.get(sessionId);
     if (!taskSession) {
-      // Skip events for sessions we're not tracking
       return;
     }
 
+    console.log(`[EventBridge] Processing event for task ${taskSession.taskId}: ${event.type}`);
+
     const { taskId } = taskSession;
+
+    // Store event for this session (for waitForSessionIdle to collect)
+    if (!this.collectedEvents.has(sessionId)) {
+      this.collectedEvents.set(sessionId, []);
+    }
+    this.collectedEvents.get(sessionId)!.push(event);
+
+    // Emit raw event for waitForSessionIdle and other listeners
+    this.emit('event', sessionId, event);
+    this.emit(`event:${sessionId}`, event);
+
+    // Emit specific lifecycle events
+    if (event.type === 'session.idle') {
+      this.emit('session:idle', sessionId, event);
+      this.emit(`session:idle:${sessionId}`, event);
+    } else if (event.type === 'session.error') {
+      this.emit('session:error', sessionId, event);
+      this.emit(`session:error:${sessionId}`, event);
+    }
 
     // Transform OpenCode event to frontend-friendly format
     const frontendEvent = this.transformEvent(event, taskId);
     if (!frontendEvent) return;
+
+    // 🔥 COST TRACKING: Record costs from step_finish events
+    if (frontendEvent.type === 'step_finish' && frontendEvent.data) {
+      costTracker.recordCost(taskId, sessionId, {
+        cost: frontendEvent.data.cost,
+        tokens: frontendEvent.data.tokens,
+      });
+    }
+
+    // 🔥 Debug: Log what we're sending (every 50th event)
+    if (Math.random() < 0.02) {
+      console.log(`[EventBridge] 📤 Sending ${frontendEvent.type} to task ${taskId}:`,
+        (frontendEvent.data.content || frontendEvent.data.tool || '').substring(0, 80));
+    }
 
     // Send as the specific event type
     socketService.toTask(taskId, frontendEvent.type, frontendEvent.data);
 
     // Also send as 'agent:activity' for the Activity tab (frontend compatibility)
     const activity = {
-      id: `activity-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: `activity-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
       taskId,
       type: frontendEvent.type,
       timestamp: new Date(),
@@ -142,6 +453,78 @@ class OpenCodeEventBridgeService {
         data: frontendEvent.data,
       },
     });
+
+    // 🔥 ML TRAINING: Only save HIGH-VALUE events
+    // CRITICAL: Be very selective to avoid noise in training data
+    // We want: (tool, input, output) tuples for learning code actions
+    this.saveForTrainingIfValuable(taskId, frontendEvent);
+  }
+
+  /**
+   * Wait for a session to become idle (finished processing)
+   * Uses the centralized event stream - NO additional subscription created
+   * @param sessionId - The session to wait for
+   * @param options.timeout - Timeout in ms (default 5 minutes)
+   * @param options.onEvent - Callback for each event received
+   * @returns All events collected for this session
+   */
+  waitForSessionIdle(sessionId: string, options?: WaitForIdleOptions): Promise<OpenCodeEvent[]> {
+    const timeout = options?.timeout || 300000; // 5 minutes default
+
+    return new Promise((resolve, reject) => {
+      // Timeout handler
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Session ${sessionId} timed out after ${timeout}ms`));
+      }, timeout);
+
+      // Event handler
+      const onEvent = (event: OpenCodeEvent) => {
+        options?.onEvent?.(event);
+      };
+
+      // Idle handler
+      const onIdle = () => {
+        cleanup();
+        const events = this.collectedEvents.get(sessionId) || [];
+        resolve(events);
+      };
+
+      // Error handler
+      const onError = (event: OpenCodeEvent) => {
+        cleanup();
+        reject(new Error(`Session error: ${event.properties?.error}`));
+      };
+
+      // Cleanup function
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        this.off(`event:${sessionId}`, onEvent);
+        this.off(`session:idle:${sessionId}`, onIdle);
+        this.off(`session:error:${sessionId}`, onError);
+      };
+
+      // Register listeners
+      this.on(`event:${sessionId}`, onEvent);
+      this.once(`session:idle:${sessionId}`, onIdle);
+      this.once(`session:error:${sessionId}`, onError);
+
+      console.log(`[EventBridge] Waiting for session ${sessionId} to become idle (timeout: ${timeout}ms)`);
+    });
+  }
+
+  /**
+   * Get collected events for a session (useful for getting events that arrived before waitForSessionIdle was called)
+   */
+  getSessionEvents(sessionId: string): OpenCodeEvent[] {
+    return this.collectedEvents.get(sessionId) || [];
+  }
+
+  /**
+   * Clear collected events for a session (call after processing)
+   */
+  clearSessionEvents(sessionId: string): void {
+    this.collectedEvents.delete(sessionId);
   }
 
   /**
@@ -216,6 +599,12 @@ class OpenCodeEventBridgeService {
       // OpenCode SDK v2 uses message.part.updated for streaming content
       case 'message.part.updated':
         const part = properties?.part;
+
+        // Debug: Log FULL part structure for tool events to understand OpenCode format
+        if (part && part.type !== 'text') {
+          console.log(`[EventBridge] 🔍 FULL Tool part:`, JSON.stringify(part, null, 2).substring(0, 1500));
+        }
+
         if (part?.type === 'text') {
           return {
             type: 'agent_output',
@@ -226,21 +615,110 @@ class OpenCodeEventBridgeService {
             },
           };
         }
-        // Tool use part
-        if (part?.type === 'tool-invocation' || part?.type === 'tool-result') {
+        // Tool use part - handle various possible type names
+        // OpenCode sends: { type: 'tool', tool: 'glob', state: { status: 'running', input: {...} } }
+        if (part?.type === 'tool-invocation' || part?.type === 'tool-result' ||
+            part?.type === 'tool-use' || part?.type === 'tool_use' ||
+            part?.type === 'tool' || // 🔥 Added 'tool' type
+            part?.toolName || part?.tool) {
+          const toolName = part.toolName || part.tool || part.name || 'tool';
+
+          // 🔥 Handle state as object or string
+          let toolStatus = '';
+          let toolInput: any = {};
+
+          if (typeof part.state === 'object' && part.state !== null) {
+            // OpenCode format: state: { status: 'running', input: {...} }
+            toolStatus = part.state.status || '';
+            // Try multiple input locations
+            toolInput = part.state.input || part.state.args || part.input || part.args || {};
+          } else {
+            // Legacy format: state is a string
+            toolStatus = part.state || part.status || '';
+            toolInput = part.input || part.args || {};
+          }
+
+          // 🔥 ROBUST: Extract file_path from multiple possible locations
+          // OpenCode may use different formats: file_path, filePath, path, file
+          let extractedFilePath = '';
+          if (typeof toolInput === 'object' && toolInput !== null) {
+            extractedFilePath = toolInput.file_path || toolInput.filePath || toolInput.path || toolInput.file || '';
+          } else if (typeof toolInput === 'string' && toolInput.includes('/')) {
+            // If input is a string that looks like a path, use it
+            extractedFilePath = toolInput;
+          }
+
+          // Also check part directly for file info
+          if (!extractedFilePath) {
+            extractedFilePath = part.file_path || part.filePath || part.path || part.file || '';
+          }
+
+          // 🔥 Normalize toolInput to always be an object with file_path for frontend
+          if (extractedFilePath && (typeof toolInput !== 'object' || !toolInput.file_path)) {
+            toolInput = typeof toolInput === 'object'
+              ? { ...toolInput, file_path: extractedFilePath }
+              : { file_path: extractedFilePath, raw: toolInput };
+          }
+
+          // Format tool info nicely
+          let content = `🔧 ${toolName}`;
+          if (toolStatus) content += ` (${toolStatus})`;
+
+          // 🔥 Format input - prioritize extracted file path for file-related tools
+          if (extractedFilePath && ['read', 'edit', 'write'].includes(toolName.toLowerCase())) {
+            content += `: ${extractedFilePath}`;
+          } else if (toolInput && typeof toolInput === 'object') {
+            // For objects, show key info based on tool type
+            if (toolName === 'glob' && toolInput.pattern) {
+              content += `: ${toolInput.pattern}`;
+            } else if (toolName === 'grep' && toolInput.pattern) {
+              content += `: ${toolInput.pattern}`;
+            } else if (toolName === 'bash' && toolInput.command) {
+              content += `: ${toolInput.command.substring(0, 100)}`;
+            } else if (toolName === 'question' && toolInput.questions) {
+              content += `: ${toolInput.questions[0]?.question || 'asking...'}`;
+            } else if (!extractedFilePath) {
+              // Generic: show first key-value (skip if we already have file_path)
+              const firstKey = Object.keys(toolInput).filter(k => k !== 'file_path' && k !== 'raw')[0];
+              if (firstKey) {
+                const val = toolInput[firstKey];
+                const valStr = typeof val === 'string' ? val : JSON.stringify(val);
+                content += `: ${valStr.substring(0, 100)}`;
+              }
+            }
+          } else if (toolInput && typeof toolInput === 'string' && !extractedFilePath) {
+            content += `: ${toolInput.substring(0, 150)}${toolInput.length > 150 ? '...' : ''}`;
+          }
+
           return {
-            type: 'agent_output',
+            type: 'tool_call',
             data: {
               taskId,
-              content: `[${part.toolName || 'tool'}] ${part.state || ''}`,
+              content,
+              tool: toolName,
+              state: toolStatus,
+              input: toolInput,
+              // 🔥 Explicit file_path at top level for frontend
+              file_path: extractedFilePath || undefined,
               streaming: true,
-              toolInfo: {
-                name: part.toolName,
-                state: part.state,
-              },
             },
           };
         }
+
+        // step-finish contains cost/token info - useful for tracking
+        if (part?.type === 'step-finish') {
+          return {
+            type: 'step_finish',
+            data: {
+              taskId,
+              reason: part.reason,
+              cost: part.cost,
+              tokens: part.tokens,
+            },
+          };
+        }
+
+        // Unknown part type - skip silently (most are internal)
         return null;
 
       case 'message.delta':
@@ -354,8 +832,51 @@ class OpenCodeEventBridgeService {
           },
         };
 
+      // 🔥 Question events - OpenCode is asking the user something
+      case 'question.asked':
+        return {
+          type: 'question_asked',
+          data: {
+            taskId,
+            questionId: properties?.questionId || properties?.id,
+            question: properties?.question || properties?.text,
+            options: properties?.options,
+            required: properties?.required ?? true,
+          },
+        };
+
+      case 'question.answered':
+        return {
+          type: 'question_answered',
+          data: {
+            taskId,
+            questionId: properties?.questionId || properties?.id,
+            answer: properties?.answer,
+          },
+        };
+
+      // Heartbeat - ignore silently (no spam)
+      case 'server.heartbeat':
+        return null;
+
+      // Session lifecycle events - ignore silently (handled elsewhere)
+      case 'session.status':
+      case 'session.updated':
+      case 'session.diff':
+        return null;
+
+      // Message lifecycle events - ignore silently
+      case 'message.updated':
+      case 'message.part.added':
+      case 'message.created':
+        // These are usually followed by message.part.updated with actual content
+        return null;
+
       default:
-        // Unknown event type - don't log spam, just skip
+        // Unknown event type - log for debugging (but don't spam)
+        if (type && !type.startsWith('server.') && !type.startsWith('session.')) {
+          console.log(`[EventBridge] ⚠️ Unknown event type: ${type}`);
+        }
         return null;
     }
   }
@@ -378,12 +899,40 @@ class OpenCodeEventBridgeService {
   }
 
   /**
-   * Force stop the event loop (for shutdown)
+   * Unregister all sessions for a task (called when task completes/fails/cancels)
    */
-  stop(): void {
-    this.shouldStopLoop = true;
+  unregisterTaskSessions(taskId: string): void {
+    const sessionsToRemove: string[] = [];
+    for (const [sessionId, session] of this.activeSessions.entries()) {
+      if (session.taskId === taskId) {
+        sessionsToRemove.push(sessionId);
+      }
+    }
+    for (const sessionId of sessionsToRemove) {
+      this.unregisterSession(sessionId);
+    }
+    if (sessionsToRemove.length > 0) {
+      console.log(`[EventBridge] Unregistered ${sessionsToRemove.length} session(s) for task ${taskId}`);
+    }
+  }
+
+  /**
+   * Force stop all event loops (for shutdown)
+   */
+  async stop(): Promise<void> {
+    // Stop the flush timer
+    this.stopFlushTimer();
+
+    // Flush any remaining activity logs before shutdown
+    await this.flushAllActivityLogs();
+
+    for (const sub of this.directorySubscriptions.values()) {
+      sub.shouldStop = true;
+    }
+    this.directorySubscriptions.clear();
     this.activeSessions.clear();
-    console.log('[EventBridge] Forced stop');
+    this.pendingActivityLogs.clear();
+    console.log('[EventBridge] Forced stop (flushed pending logs)');
   }
 }
 

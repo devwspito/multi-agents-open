@@ -1,11 +1,16 @@
 /**
  * Task Repository
  *
- * Manages orchestration tasks
+ * Manages orchestration tasks (PostgreSQL)
  */
 
-import { db, generateId } from '../index.js';
+import { postgresService } from '../postgres/PostgresService.js';
 import { Task, TaskStatus } from '../../types/index.js';
+
+// Generate unique IDs
+function generateId(): string {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 10)}`;
+}
 
 export interface CreateTaskParams {
   userId: string;
@@ -22,150 +27,249 @@ export interface UpdateTaskParams {
   status?: TaskStatus;
 }
 
+interface TaskRow {
+  id: string;
+  user_id: string;
+  project_id: string | null;
+  repository_id: string | null;
+  title: string;
+  description: string | null;
+  status: string;
+  branch_name: string | null;
+  analysis: any | null;
+  stories: any | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function mapRow(row: TaskRow): Task {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    projectId: row.project_id || undefined,
+    repositoryId: row.repository_id || undefined,
+    title: row.title,
+    description: row.description || undefined,
+    status: row.status as TaskStatus,
+    branchName: row.branch_name || undefined,
+    analysis: row.analysis || undefined,
+    stories: row.stories || undefined,
+    prNumber: row.pr_number || undefined,
+    prUrl: row.pr_url || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export class TaskRepository {
   /**
    * Create a new task
    */
-  static create(params: CreateTaskParams): Task {
+  static async create(params: CreateTaskParams): Promise<Task> {
     const id = generateId();
-    const now = new Date().toISOString();
     const status = params.status || 'pending';
 
-    const stmt = db.prepare(`
-      INSERT INTO tasks (id, user_id, project_id, repository_id, title, description, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    await postgresService.query(
+      `INSERT INTO tasks (id, user_id, project_id, repository_id, title, description, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, params.userId, params.projectId || null, params.repositoryId || null, params.title, params.description || null, status]
+    );
 
-    stmt.run(id, params.userId, params.projectId, params.repositoryId, params.title, params.description, status, now, now);
-
-    return {
-      id,
-      userId: params.userId,
-      projectId: params.projectId,
-      repositoryId: params.repositoryId,
-      title: params.title,
-      description: params.description,
-      status,
-      createdAt: new Date(now),
-      updatedAt: new Date(now),
-    };
+    const task = await this.findById(id);
+    return task!;
   }
 
   /**
    * Find task by ID
    */
-  static findById(id: string): Task | null {
-    const stmt = db.prepare(`SELECT * FROM tasks WHERE id = ?`);
-    const row = stmt.get(id) as any;
-    return row ? this.mapRow(row) : null;
+  static async findById(id: string): Promise<Task | null> {
+    const result = await postgresService.query<TaskRow>(
+      'SELECT * FROM tasks WHERE id = $1',
+      [id]
+    );
+    const row = result.rows[0];
+    return row ? mapRow(row) : null;
   }
 
   /**
    * Find all tasks
    */
-  static findAll(options: {
+  static async findAll(options: {
     projectId?: string;
     status?: TaskStatus;
     limit?: number;
     offset?: number;
-  } = {}): Task[] {
-    let query = `SELECT * FROM tasks WHERE 1=1`;
+  } = {}): Promise<Task[]> {
+    let query = 'SELECT * FROM tasks WHERE 1=1';
     const params: any[] = [];
+    let paramIndex = 1;
 
     if (options.projectId) {
-      query += ` AND project_id = ?`;
+      query += ` AND project_id = $${paramIndex}`;
       params.push(options.projectId);
+      paramIndex++;
     }
 
     if (options.status) {
-      query += ` AND status = ?`;
+      query += ` AND status = $${paramIndex}`;
       params.push(options.status);
+      paramIndex++;
     }
 
-    query += ` ORDER BY created_at DESC`;
+    query += ' ORDER BY created_at DESC';
 
     if (options.limit) {
-      query += ` LIMIT ?`;
+      query += ` LIMIT $${paramIndex}`;
       params.push(options.limit);
+      paramIndex++;
     }
 
     if (options.offset) {
-      query += ` OFFSET ?`;
+      query += ` OFFSET $${paramIndex}`;
       params.push(options.offset);
     }
 
-    const stmt = db.prepare(query);
-    const rows = stmt.all(...params) as any[];
-    return rows.map(row => this.mapRow(row));
+    const result = await postgresService.query<TaskRow>(query, params);
+    return result.rows.map(mapRow);
   }
 
   /**
    * Update task
    */
-  static update(id: string, params: UpdateTaskParams): Task | null {
-    const existing = this.findById(id);
+  static async update(id: string, params: UpdateTaskParams): Promise<Task | null> {
+    const existing = await this.findById(id);
     if (!existing) return null;
 
-    const now = new Date().toISOString();
-    const updates: string[] = ['updated_at = ?'];
-    const values: any[] = [now];
+    const updates: string[] = ['updated_at = NOW()'];
+    const values: any[] = [];
+    let paramIndex = 1;
 
     if (params.title !== undefined) {
-      updates.push('title = ?');
+      updates.push(`title = $${paramIndex}`);
       values.push(params.title);
+      paramIndex++;
     }
 
     if (params.description !== undefined) {
-      updates.push('description = ?');
+      updates.push(`description = $${paramIndex}`);
       values.push(params.description);
+      paramIndex++;
     }
 
     if (params.status !== undefined) {
-      updates.push('status = ?');
+      updates.push(`status = $${paramIndex}`);
       values.push(params.status);
+      paramIndex++;
     }
 
     values.push(id);
 
-    const stmt = db.prepare(`
-      UPDATE tasks SET ${updates.join(', ')} WHERE id = ?
-    `);
+    await postgresService.query(
+      `UPDATE tasks SET ${updates.join(', ')} WHERE id = $${paramIndex}`,
+      values
+    );
 
-    stmt.run(...values);
     return this.findById(id);
   }
 
   /**
    * Update task status
    */
-  static updateStatus(id: string, status: TaskStatus): void {
-    const now = new Date().toISOString();
-    const stmt = db.prepare(`
-      UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?
-    `);
-    stmt.run(status, now, id);
+  static async updateStatus(id: string, status: TaskStatus): Promise<void> {
+    await postgresService.query(
+      'UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2',
+      [status, id]
+    );
+  }
+
+  /**
+   * Set branch name for task
+   */
+  static async setBranchName(id: string, branchName: string): Promise<void> {
+    await postgresService.query(
+      'UPDATE tasks SET branch_name = $1, updated_at = NOW() WHERE id = $2',
+      [branchName, id]
+    );
+  }
+
+  /**
+   * Set analysis result for task
+   */
+  static async setAnalysis(id: string, analysis: any): Promise<void> {
+    await postgresService.query(
+      'UPDATE tasks SET analysis = $1, updated_at = NOW() WHERE id = $2',
+      [JSON.stringify(analysis), id]
+    );
+  }
+
+  /**
+   * Set stories for task
+   */
+  static async setStories(id: string, stories: any[]): Promise<void> {
+    await postgresService.query(
+      'UPDATE tasks SET stories = $1, updated_at = NOW() WHERE id = $2',
+      [JSON.stringify(stories), id]
+    );
+  }
+
+  /**
+   * Set PR info for task
+   */
+  static async setPullRequest(id: string, prNumber: number, prUrl: string): Promise<void> {
+    await postgresService.query(
+      'UPDATE tasks SET pr_number = $1, pr_url = $2, updated_at = NOW() WHERE id = $3',
+      [prNumber, prUrl, id]
+    );
+  }
+
+  /**
+   * Update orchestration data after analysis phase
+   */
+  static async updateAfterAnalysis(
+    id: string,
+    data: { branchName: string; analysis: any; stories: any[] }
+  ): Promise<void> {
+    await postgresService.query(
+      `UPDATE tasks SET
+        branch_name = $1,
+        analysis = $2,
+        stories = $3,
+        updated_at = NOW()
+       WHERE id = $4`,
+      [data.branchName, JSON.stringify(data.analysis), JSON.stringify(data.stories), id]
+    );
   }
 
   /**
    * Delete task
    */
-  static delete(id: string): boolean {
-    const stmt = db.prepare(`DELETE FROM tasks WHERE id = ?`);
-    const result = stmt.run(id);
-    return result.changes > 0;
+  static async delete(id: string): Promise<boolean> {
+    const result = await postgresService.query(
+      'DELETE FROM tasks WHERE id = $1',
+      [id]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   /**
    * Get task statistics
    */
-  static getStats(): {
+  static async getStats(): Promise<{
     total: number;
     pending: number;
     running: number;
     completed: number;
     failed: number;
-  } {
-    const stmt = db.prepare(`
+  }> {
+    const result = await postgresService.query<{
+      total: string;
+      pending: string;
+      running: string;
+      completed: string;
+      failed: string;
+    }>(`
       SELECT
         COUNT(*) as total,
         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
@@ -174,14 +278,14 @@ export class TaskRepository {
         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
       FROM tasks
     `);
-    const row = stmt.get() as any;
 
+    const row = result.rows[0];
     return {
-      total: row.total || 0,
-      pending: row.pending || 0,
-      running: row.running || 0,
-      completed: row.completed || 0,
-      failed: row.failed || 0,
+      total: parseInt(row.total, 10) || 0,
+      pending: parseInt(row.pending, 10) || 0,
+      running: parseInt(row.running, 10) || 0,
+      completed: parseInt(row.completed, 10) || 0,
+      failed: parseInt(row.failed, 10) || 0,
     };
   }
 
@@ -190,33 +294,104 @@ export class TaskRepository {
    * Marks tasks that were 'running' or 'paused' as 'interrupted'
    * Should be called during server initialization
    */
-  static recoverStaleTasks(): number {
-    const now = new Date().toISOString();
-    const stmt = db.prepare(`
+  static async recoverStaleTasks(): Promise<number> {
+    const result = await postgresService.query(`
       UPDATE tasks
-      SET status = 'interrupted', updated_at = ?
+      SET status = 'interrupted', updated_at = NOW()
       WHERE status IN ('running', 'paused')
     `);
-    const result = stmt.run(now);
 
-    if (result.changes > 0) {
-      console.log(`[TaskRepository] Recovered ${result.changes} stale task(s) from previous session`);
+    const changes = result.rowCount ?? 0;
+    if (changes > 0) {
+      console.log(`[TaskRepository] Recovered ${changes} stale task(s) from previous session`);
     }
 
-    return result.changes;
+    return changes;
   }
 
-  private static mapRow(row: any): Task {
-    return {
-      id: row.id,
-      userId: row.user_id,
-      projectId: row.project_id,
-      repositoryId: row.repository_id,
-      title: row.title,
-      description: row.description,
-      status: row.status,
-      createdAt: new Date(row.created_at),
-      updatedAt: new Date(row.updated_at),
+  // ============================================
+  // ACTIVITY LOG METHODS
+  // ============================================
+
+  /**
+   * Append an activity log entry to a task
+   * Stores important events for replay when page refreshes
+   */
+  static async appendActivityLog(taskId: string, entry: {
+    type: string;
+    content: string;
+    timestamp?: string;
+    tool?: string;
+    toolState?: string;
+  }): Promise<void> {
+    const logEntry = {
+      ...entry,
+      timestamp: entry.timestamp || new Date().toISOString(),
     };
+
+    await postgresService.query(`
+      UPDATE tasks
+      SET activity_log = COALESCE(activity_log, '[]'::jsonb) || $2::jsonb,
+          updated_at = NOW()
+      WHERE id = $1
+    `, [taskId, JSON.stringify([logEntry])]);
+  }
+
+  /**
+   * Append multiple activity log entries at once (more efficient)
+   */
+  static async appendActivityLogs(taskId: string, entries: Array<{
+    type: string;
+    content: string;
+    timestamp?: string;
+    tool?: string;
+    toolState?: string;
+    toolInput?: any;  // Full tool input for ML training (old_string, new_string, file_path)
+    toolOutput?: any; // Tool result/output
+  }>): Promise<void> {
+    if (entries.length === 0) return;
+
+    const logEntries = entries.map(entry => ({
+      ...entry,
+      timestamp: entry.timestamp || new Date().toISOString(),
+    }));
+
+    await postgresService.query(`
+      UPDATE tasks
+      SET activity_log = COALESCE(activity_log, '[]'::jsonb) || $2::jsonb,
+          updated_at = NOW()
+      WHERE id = $1
+    `, [taskId, JSON.stringify(logEntries)]);
+  }
+
+  /**
+   * Get activity logs for a task
+   * Returns full event data including tool input/output for ML training
+   */
+  static async getActivityLog(taskId: string): Promise<Array<{
+    type: string;
+    content: string;
+    timestamp: string;
+    tool?: string;
+    toolState?: string;
+    toolInput?: any;   // Full tool input (old_string, new_string, file_path, command, etc.)
+    toolOutput?: any;  // Tool result/output
+  }>> {
+    const result = await postgresService.query<{ activity_log: any }>(
+      `SELECT activity_log FROM tasks WHERE id = $1`,
+      [taskId]
+    );
+    return result.rows[0]?.activity_log || [];
+  }
+
+  /**
+   * Clear activity logs for a task (e.g., when task is restarted)
+   */
+  static async clearActivityLog(taskId: string): Promise<void> {
+    await postgresService.query(`
+      UPDATE tasks SET activity_log = '[]'::jsonb, updated_at = NOW() WHERE id = $1
+    `, [taskId]);
   }
 }
+
+export default TaskRepository;

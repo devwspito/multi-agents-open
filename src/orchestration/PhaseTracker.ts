@@ -8,6 +8,7 @@
  */
 
 import { agentSpy, Vulnerability } from '../services/security/AgentSpy.js';
+import { openCodeEventBridge } from '../services/opencode/OpenCodeEventBridge.js';
 import { executionTracker } from '../services/training/ExecutionTracker.js';
 import {
   sentinentalWebhook,
@@ -96,6 +97,8 @@ function getTaskTrackingState(taskId: string): TaskTrackingState {
 export function cleanupTaskTracking(taskId: string): void {
   taskTrackingStates.delete(taskId);
   agentSpy.clear(taskId);
+  // Clean up EventBridge sessions for this task
+  openCodeEventBridge.unregisterTaskSessions(taskId);
 }
 
 /**

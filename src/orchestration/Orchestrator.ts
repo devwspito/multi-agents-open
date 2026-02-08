@@ -102,7 +102,7 @@ class OrchestratorClass {
     const startTime = Date.now();
 
     // Get task
-    const task = TaskRepository.findById(taskId);
+    const task = await TaskRepository.findById(taskId);
     if (!task) {
       return {
         success: false,
@@ -128,7 +128,7 @@ class OrchestratorClass {
     }
 
     // Update task status
-    TaskRepository.updateStatus(taskId, 'running');
+    await TaskRepository.updateStatus(taskId, 'running');
 
     // Create context with repositories
     const context: PhaseContext = {
@@ -181,7 +181,7 @@ class OrchestratorClass {
 
         if (!result.success) {
           console.log(`[Orchestrator] Analysis failed: ${result.error}`);
-          TaskRepository.updateStatus(taskId, 'failed');
+          await TaskRepository.updateStatus(taskId, 'failed');
           return {
             success: false,
             taskId,
@@ -195,7 +195,7 @@ class OrchestratorClass {
         console.log(`[Orchestrator] Analysis completed successfully`);
       } catch (error: any) {
         console.log(`[Orchestrator] Analysis error: ${error.message}`);
-        TaskRepository.updateStatus(taskId, 'failed');
+        await TaskRepository.updateStatus(taskId, 'failed');
         return {
           success: false,
           taskId,
@@ -393,7 +393,7 @@ class OrchestratorClass {
     }
 
     // Update task status
-    TaskRepository.updateStatus(taskId, success ? 'completed' : 'failed');
+    await TaskRepository.updateStatus(taskId, success ? 'completed' : 'failed');
 
     const duration = Date.now() - startTime;
     console.log(`\n${'='.repeat(60)}`);
@@ -502,7 +502,7 @@ class OrchestratorClass {
       }
     }
 
-    TaskRepository.updateStatus(taskId, success ? 'completed' : 'failed');
+    await TaskRepository.updateStatus(taskId, success ? 'completed' : 'failed');
 
     const duration = Date.now() - startTime;
     console.log(`\n[Orchestrator] Pipeline ${pipeline.name} ${success ? 'completed' : 'failed'} in ${duration}ms`);
@@ -537,7 +537,7 @@ class OrchestratorClass {
       onSessionCreated?: (sessionId: string, phaseName: string) => void;
     } = {}
   ): Promise<PhaseResult> {
-    const task = TaskRepository.findById(taskId);
+    const task = await TaskRepository.findById(taskId);
     if (!task) {
       return {
         success: false,

@@ -1,12 +1,17 @@
 /**
  * Repository Repository
  *
- * Database operations for git repositories (SQLite)
+ * Database operations for git repositories (PostgreSQL)
  * Matches agents-software-arq schema (sin workspaceId - es por task)
  */
 
-import { db, generateId, now } from '../index.js';
+import { postgresService } from '../postgres/PostgresService.js';
 import { CryptoService } from '../../services/security/CryptoService.js';
+
+// Generate unique IDs
+function generateId(): string {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 10)}`;
+}
 
 export interface IEnvVariable {
   key: string;
@@ -43,28 +48,14 @@ interface RepositoryRow {
   github_repo_name: string;
   github_branch: string;
   type: string;
-  path_patterns: string | null;
+  path_patterns: string[] | null;
   execution_order: number | null;
-  dependencies: string | null;
-  env_variables: string | null;
-  is_active: number;
-  last_synced_at: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-function parseJSON<T>(value: string | null, defaultValue: T): T {
-  if (!value) return defaultValue;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return defaultValue;
-  }
-}
-
-function toJSON(value: any): string | null {
-  if (value === undefined || value === null) return null;
-  return JSON.stringify(value);
+  dependencies: string[] | null;
+  env_variables: IEnvVariable[] | null;
+  is_active: boolean;
+  last_synced_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
 }
 
 function rowToRepository(row: RepositoryRow): IRepository {
@@ -77,14 +68,14 @@ function rowToRepository(row: RepositoryRow): IRepository {
     githubRepoName: row.github_repo_name,
     githubBranch: row.github_branch,
     type: row.type as 'backend' | 'frontend' | 'mobile' | 'shared',
-    pathPatterns: parseJSON(row.path_patterns, []),
+    pathPatterns: row.path_patterns || [],
     executionOrder: row.execution_order || undefined,
-    dependencies: parseJSON(row.dependencies, undefined),
-    envVariables: parseJSON(row.env_variables, []),
-    isActive: row.is_active === 1,
-    lastSyncedAt: row.last_synced_at ? new Date(row.last_synced_at) : undefined,
-    createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at),
+    dependencies: row.dependencies || undefined,
+    envVariables: row.env_variables || [],
+    isActive: row.is_active,
+    lastSyncedAt: row.last_synced_at || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -149,34 +140,42 @@ export class RepositoryRepository {
   /**
    * Find repository by ID
    */
-  static findById(id: string): IRepository | null {
-    const stmt = db.prepare(`SELECT * FROM repositories WHERE id = ?`);
-    const row = stmt.get(id) as RepositoryRow | undefined;
+  static async findById(id: string): Promise<IRepository | null> {
+    const result = await postgresService.query<RepositoryRow>(
+      'SELECT * FROM repositories WHERE id = $1',
+      [id]
+    );
+    const row = result.rows[0];
     return row ? rowToRepository(row) : null;
   }
 
   /**
    * Find repositories by project ID
    */
-  static findByProjectId(projectId: string): IRepository[] {
-    const stmt = db.prepare(`SELECT * FROM repositories WHERE project_id = ? AND is_active = 1 ORDER BY execution_order, created_at`);
-    const rows = stmt.all(projectId) as RepositoryRow[];
-    return rows.map(rowToRepository);
+  static async findByProjectId(projectId: string): Promise<IRepository[]> {
+    const result = await postgresService.query<RepositoryRow>(
+      'SELECT * FROM repositories WHERE project_id = $1 AND is_active = true ORDER BY execution_order, created_at',
+      [projectId]
+    );
+    return result.rows.map(rowToRepository);
   }
 
   /**
    * Find repository by GitHub repo name within a project
    */
-  static findByGithubRepoName(projectId: string, githubRepoName: string): IRepository | null {
-    const stmt = db.prepare(`SELECT * FROM repositories WHERE project_id = ? AND github_repo_name = ?`);
-    const row = stmt.get(projectId, githubRepoName) as RepositoryRow | undefined;
+  static async findByGithubRepoName(projectId: string, githubRepoName: string): Promise<IRepository | null> {
+    const result = await postgresService.query<RepositoryRow>(
+      'SELECT * FROM repositories WHERE project_id = $1 AND github_repo_name = $2',
+      [projectId, githubRepoName]
+    );
+    const row = result.rows[0];
     return row ? rowToRepository(row) : null;
   }
 
   /**
    * Create a new repository
    */
-  static create(data: {
+  static async create(data: {
     name: string;
     description?: string;
     projectId: string;
@@ -188,49 +187,46 @@ export class RepositoryRepository {
     executionOrder?: number;
     dependencies?: string[];
     envVariables?: IEnvVariable[];
-  }): IRepository {
+  }): Promise<IRepository> {
     const id = generateId();
-    const timestamp = now();
 
     // Get default config if not provided
     const defaultConfig = getRepositoryConfig(data.type, data.name);
     const pathPatterns = data.pathPatterns || defaultConfig.pathPatterns;
     const executionOrder = data.executionOrder ?? defaultConfig.executionOrder;
 
-    const stmt = db.prepare(`
-      INSERT INTO repositories (
+    await postgresService.query(
+      `INSERT INTO repositories (
         id, name, description, project_id,
         github_repo_url, github_repo_name, github_branch,
         type, path_patterns, execution_order, dependencies, env_variables,
-        is_active, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    stmt.run(
-      id,
-      data.name,
-      data.description || null,
-      data.projectId,
-      data.githubRepoUrl,
-      data.githubRepoName,
-      data.githubBranch || 'main',
-      data.type,
-      toJSON(pathPatterns),
-      executionOrder,
-      toJSON(data.dependencies || []),
-      toJSON(data.envVariables || []),
-      1,
-      timestamp,
-      timestamp
+        is_active
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        id,
+        data.name,
+        data.description || null,
+        data.projectId,
+        data.githubRepoUrl,
+        data.githubRepoName,
+        data.githubBranch || 'main',
+        data.type,
+        JSON.stringify(pathPatterns),
+        executionOrder,
+        JSON.stringify(data.dependencies || []),
+        JSON.stringify(data.envVariables || []),
+        true,
+      ]
     );
 
-    return this.findById(id)!;
+    const repo = await this.findById(id);
+    return repo!;
   }
 
   /**
    * Update repository
    */
-  static update(id: string, data: Partial<{
+  static async update(id: string, data: Partial<{
     name: string;
     description: string;
     githubRepoUrl: string;
@@ -243,43 +239,41 @@ export class RepositoryRepository {
     envVariables: IEnvVariable[];
     isActive: boolean;
     lastSyncedAt: Date;
-  }>): IRepository | null {
-    const existing = this.findById(id);
+  }>): Promise<IRepository | null> {
+    const existing = await this.findById(id);
     if (!existing) return null;
 
-    const stmt = db.prepare(`
-      UPDATE repositories SET
-        name = COALESCE(?, name),
-        description = COALESCE(?, description),
-        github_repo_url = COALESCE(?, github_repo_url),
-        github_repo_name = COALESCE(?, github_repo_name),
-        github_branch = COALESCE(?, github_branch),
-        type = COALESCE(?, type),
-        path_patterns = COALESCE(?, path_patterns),
-        execution_order = COALESCE(?, execution_order),
-        dependencies = COALESCE(?, dependencies),
-        env_variables = COALESCE(?, env_variables),
-        is_active = COALESCE(?, is_active),
-        last_synced_at = COALESCE(?, last_synced_at),
-        updated_at = ?
-      WHERE id = ?
-    `);
-
-    stmt.run(
-      data.name || null,
-      data.description || null,
-      data.githubRepoUrl || null,
-      data.githubRepoName || null,
-      data.githubBranch || null,
-      data.type || null,
-      data.pathPatterns ? toJSON(data.pathPatterns) : null,
-      data.executionOrder ?? null,
-      data.dependencies ? toJSON(data.dependencies) : null,
-      data.envVariables ? toJSON(data.envVariables) : null,
-      data.isActive !== undefined ? (data.isActive ? 1 : 0) : null,
-      data.lastSyncedAt ? data.lastSyncedAt.toISOString() : null,
-      now(),
-      id
+    await postgresService.query(
+      `UPDATE repositories SET
+        name = COALESCE($1, name),
+        description = COALESCE($2, description),
+        github_repo_url = COALESCE($3, github_repo_url),
+        github_repo_name = COALESCE($4, github_repo_name),
+        github_branch = COALESCE($5, github_branch),
+        type = COALESCE($6, type),
+        path_patterns = COALESCE($7, path_patterns),
+        execution_order = COALESCE($8, execution_order),
+        dependencies = COALESCE($9, dependencies),
+        env_variables = COALESCE($10, env_variables),
+        is_active = COALESCE($11, is_active),
+        last_synced_at = COALESCE($12, last_synced_at),
+        updated_at = NOW()
+      WHERE id = $13`,
+      [
+        data.name || null,
+        data.description || null,
+        data.githubRepoUrl || null,
+        data.githubRepoName || null,
+        data.githubBranch || null,
+        data.type || null,
+        data.pathPatterns ? JSON.stringify(data.pathPatterns) : null,
+        data.executionOrder ?? null,
+        data.dependencies ? JSON.stringify(data.dependencies) : null,
+        data.envVariables ? JSON.stringify(data.envVariables) : null,
+        data.isActive !== undefined ? data.isActive : null,
+        data.lastSyncedAt || null,
+        id,
+      ]
     );
 
     return this.findById(id);
@@ -288,49 +282,57 @@ export class RepositoryRepository {
   /**
    * Delete repository (soft delete)
    */
-  static delete(id: string): boolean {
-    const stmt = db.prepare(`UPDATE repositories SET is_active = 0, updated_at = ? WHERE id = ?`);
-    const result = stmt.run(now(), id);
-    return result.changes > 0;
+  static async delete(id: string): Promise<boolean> {
+    const result = await postgresService.query(
+      'UPDATE repositories SET is_active = false, updated_at = NOW() WHERE id = $1',
+      [id]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   /**
    * Hard delete repository
    */
-  static hardDelete(id: string): boolean {
-    const stmt = db.prepare(`DELETE FROM repositories WHERE id = ?`);
-    const result = stmt.run(id);
-    return result.changes > 0;
+  static async hardDelete(id: string): Promise<boolean> {
+    const result = await postgresService.query(
+      'DELETE FROM repositories WHERE id = $1',
+      [id]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   /**
    * Update last synced timestamp
    */
-  static updateLastSynced(id: string): void {
-    const stmt = db.prepare(`UPDATE repositories SET last_synced_at = ?, updated_at = ? WHERE id = ?`);
-    const timestamp = now();
-    stmt.run(timestamp, timestamp, id);
+  static async updateLastSynced(id: string): Promise<void> {
+    await postgresService.query(
+      'UPDATE repositories SET last_synced_at = NOW(), updated_at = NOW() WHERE id = $1',
+      [id]
+    );
   }
 
   /**
    * Count repositories by project
    */
-  static countByProject(projectId: string): number {
-    const stmt = db.prepare(`SELECT COUNT(*) as count FROM repositories WHERE project_id = ? AND is_active = 1`);
-    const row = stmt.get(projectId) as { count: number };
-    return row.count;
+  static async countByProject(projectId: string): Promise<number> {
+    const result = await postgresService.query<{ count: string }>(
+      'SELECT COUNT(*) as count FROM repositories WHERE project_id = $1 AND is_active = true',
+      [projectId]
+    );
+    return parseInt(result.rows[0].count, 10);
   }
 
   /**
    * Find multiple repositories by IDs
    */
-  static findByIds(ids: string[]): IRepository[] {
+  static async findByIds(ids: string[]): Promise<IRepository[]> {
     if (ids.length === 0) return [];
 
-    const placeholders = ids.map(() => '?').join(',');
-    const stmt = db.prepare(`SELECT * FROM repositories WHERE id IN (${placeholders}) AND is_active = 1`);
-    const rows = stmt.all(...ids) as RepositoryRow[];
-    return rows.map(rowToRepository);
+    const result = await postgresService.query<RepositoryRow>(
+      'SELECT * FROM repositories WHERE id = ANY($1) AND is_active = true',
+      [ids]
+    );
+    return result.rows.map(rowToRepository);
   }
 
   /**
@@ -341,8 +343,8 @@ export class RepositoryRepository {
   /**
    * Get decrypted environment variables for a repository
    */
-  static getDecryptedEnvVariables(id: string): IEnvVariable[] {
-    const repo = this.findById(id);
+  static async getDecryptedEnvVariables(id: string): Promise<IEnvVariable[]> {
+    const repo = await this.findById(id);
     if (!repo) return [];
 
     return repo.envVariables.map(envVar => {

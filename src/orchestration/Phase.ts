@@ -522,6 +522,44 @@ export abstract class BasePhase implements IPhase {
   }
 
   /**
+   * Determine the working directory for OpenCode session
+   *
+   * OpenCode needs a REAL project directory (with package.json, .git, etc.)
+   * NOT a parent workspace directory that just contains repo folders.
+   *
+   * Priority:
+   * 1. First 'backend' type repo (most common primary)
+   * 2. First repo by executionOrder
+   * 3. First repo in list
+   * 4. Fallback to projectPath (workspace parent)
+   */
+  protected determineWorkingDirectory(context: PhaseContext): string {
+    const { repositories, projectPath } = context;
+
+    if (!repositories || repositories.length === 0) {
+      console.log(`[${this.name}] No repositories found, using projectPath`);
+      return projectPath;
+    }
+
+    // Sort by executionOrder (if defined) then by type priority
+    const sorted = [...repositories].sort((a, b) => {
+      // Backend repos get priority
+      if (a.type === 'backend' && b.type !== 'backend') return -1;
+      if (b.type === 'backend' && a.type !== 'backend') return 1;
+
+      // Then by executionOrder
+      const orderA = a.executionOrder ?? 999;
+      const orderB = b.executionOrder ?? 999;
+      return orderA - orderB;
+    });
+
+    const primaryRepo = sorted[0];
+    console.log(`[${this.name}] Selected primary repo: ${primaryRepo.name} (${primaryRepo.type}) at ${primaryRepo.localPath}`);
+
+    return primaryRepo.localPath;
+  }
+
+  /**
    * Default validation - always passes
    * Override in subclasses for specific validation
    */
@@ -636,14 +674,14 @@ export abstract class BasePhase implements IPhase {
       prompt,
     });
 
-    // Create OpenCode session with the correct working directory
-    // CRITICAL: projectPath is where the user's repo was cloned
-    const workingDirectory = context.projectPath;
-    console.log(`[${this.name}] Using working directory: ${workingDirectory}`);
+    // Create OpenCode session with the workspace path (not individual repo)
+    // This allows OpenCode to see all repositories in the workspace (frontend + backend)
+    const projectPath = context.projectPath;
+    console.log(`[${this.name}] Using workspace path: ${projectPath}`);
 
     const sessionId = await openCodeClient.createSession({
       title: `${this.name} - ${task.title}`,
-      directory: workingDirectory,
+      directory: projectPath,
     });
 
     console.log(`[${this.name}] Created session: ${sessionId}`);
@@ -652,12 +690,21 @@ export abstract class BasePhase implements IPhase {
     context.onSessionCreated?.(sessionId, this.name);
 
     // CRITICAL: Register session for event forwarding to frontend
-    openCodeEventBridge.registerSession(task.id, sessionId);
+    // Must pass directory for correct event subscription
+    console.log(`[${this.name}] About to register session with EventBridge...`);
+    openCodeEventBridge.registerSession(task.id, sessionId, projectPath);
+
+    // Wait for event subscription to be established before sending prompt
+    // This is critical - OpenCode needs an active event consumer before processing
+    console.log(`[${this.name}] Waiting for event subscription to establish...`);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    console.log(`[${this.name}] EventBridge ready, now sending prompt...`);
 
     // Send prompt with the same directory
     await openCodeClient.sendPrompt(sessionId, prompt, {
-      directory: workingDirectory,
+      directory: projectPath,
     });
+    console.log(`[${this.name}] Prompt sent successfully`);
 
     // ========================================
     // EXECUTION STATE for Sentinental context
@@ -693,8 +740,10 @@ export abstract class BasePhase implements IPhase {
 
     try {
       // Wait for completion while tracking events
+      // CRITICAL: Must pass the same directory as the session was created in
       const allEvents = await openCodeClient.waitForIdle(sessionId, {
         timeout: this.config.timeout || 300000,
+        directory: projectPath, // Same directory as session
         onEvent: (event) => {
           events.push(event);
 

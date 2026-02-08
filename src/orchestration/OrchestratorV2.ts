@@ -2,13 +2,14 @@
  * Orchestrator V2
  *
  * 4-phase architecture:
- * 1. Analysis Phase - Create branch, analyze task, break into stories
- * 2. Developer Phase - Implement all stories with DEV → JUDGE → SPY loop
+ * 1. Analysis Phase - Create branch, analyze task, break into stories (1 session)
+ * 2. Developer Phase - Implement all stories with DEV → JUDGE → SPY loop (1 session per story)
  * 3. Merge Phase - Create PR, wait for approval, merge
  * 4. Global Scan Phase - ALWAYS runs, comprehensive security scan
  *
  * Key principles:
- * - One OpenCode session per phase (not per story)
+ * - Analysis/Merge: 1 session per phase
+ * - Developer: 1 session per STORY (for context isolation)
  * - All Git operations happen at HOST level
  * - SPY runs at end of each iteration within phases
  * - Global Scan runs at the END, always, even if Merge fails
@@ -18,8 +19,11 @@
 import { Task, Story, RepositoryInfo, GlobalVulnerabilityScan } from '../types/index.js';
 import { TaskRepository } from '../database/repositories/TaskRepository.js';
 import { sentinentalWebhook } from '../services/training/index.js';
-import { socketService } from '../services/realtime/index.js';
+import { socketService, approvalService } from '../services/realtime/index.js';
 import { cleanupTaskTracking } from './PhaseTracker.js';
+import { getProjectLLMConfig, getFullProjectLLMConfig } from '../api/routes/projects.js';
+import { openCodeClient } from '../services/opencode/OpenCodeClient.js';
+import { toOpenCodeProvider, hasPhaseOverrides, type PhaseType } from '../config/llmProviders.js';
 
 // Import V2 phases
 import {
@@ -53,8 +57,8 @@ export interface OrchestrationOptions {
   projectPath?: string;
   /** All repositories for this project */
   repositories?: RepositoryInfo[];
-  /** Approval mode for phases */
-  approvalMode?: ApprovalMode;
+  /** Phase approval mode - 'manual' requires user approval between phases, 'automatic' continues without pause */
+  phaseApprovalMode?: ApprovalMode;
   /** Auto-merge PR without approval */
   autoMerge?: boolean;
   /** Called when Analysis phase completes */
@@ -95,10 +99,14 @@ class OrchestratorV2Class {
     const startTime = Date.now();
     const projectPath = options.projectPath || process.cwd();
     const repositories = options.repositories || [];
-    const autoApprove = options.approvalMode === 'automatic';
+    // OpenCode sessions ALWAYS have all permissions (autoApprove = true)
+    const autoApprove = true;
+    // Phase approval mode - default to 'manual' (user must approve between phases)
+    const phaseApprovalMode = options.phaseApprovalMode || 'manual';
 
     console.log(`\n${'═'.repeat(70)}`);
     console.log(`[OrchestratorV2] Starting task: ${taskId}`);
+    console.log(`[OrchestratorV2] Phase approval mode: ${phaseApprovalMode}`);
     console.log(`${'═'.repeat(70)}`);
 
     // Get task
@@ -115,11 +123,72 @@ class OrchestratorV2Class {
     // Update task status
     await TaskRepository.updateStatus(taskId, 'running');
 
+    // 🔥 Get project LLM configuration with per-phase support
+    const fullLLMConfig = task.projectId
+      ? await getFullProjectLLMConfig(task.projectId)
+      : { default: { provider: 'local', model: 'kimi-dev-72b' } };
+
+    // Get per-phase configs
+    const analysisLLMConfig = task.projectId
+      ? await getProjectLLMConfig(task.projectId, 'analysis')
+      : { providerID: 'dgx-spark', modelID: 'kimi-dev-72b' };
+
+    const developerLLMConfig = task.projectId
+      ? await getProjectLLMConfig(task.projectId, 'developer')
+      : { providerID: 'dgx-spark', modelID: 'kimi-dev-72b' };
+
+    const securityLLMConfig = task.projectId
+      ? await getProjectLLMConfig(task.projectId, 'security')
+      : { providerID: 'dgx-spark', modelID: 'kimi-dev-72b' };
+
+    // Log configuration
+    const hasOverrides = hasPhaseOverrides(fullLLMConfig);
+    console.log(`[OrchestratorV2] LLM Default: ${toOpenCodeProvider(fullLLMConfig.default.provider as any)}/${fullLLMConfig.default.model}`);
+    if (hasOverrides) {
+      console.log(`[OrchestratorV2] Per-phase overrides:`);
+      console.log(`  - Analysis: ${analysisLLMConfig.providerID}/${analysisLLMConfig.modelID}`);
+      console.log(`  - Developer: ${developerLLMConfig.providerID}/${developerLLMConfig.modelID}`);
+      console.log(`  - Security: ${securityLLMConfig.providerID}/${securityLLMConfig.modelID}`);
+    }
+
+    // Configure auth for all unique providers that need API keys
+    const uniqueConfigs = [
+      { config: fullLLMConfig.default, phase: 'default' },
+      ...(fullLLMConfig.phases?.analysis ? [{ config: fullLLMConfig.phases.analysis, phase: 'analysis' }] : []),
+      ...(fullLLMConfig.phases?.developer ? [{ config: fullLLMConfig.phases.developer, phase: 'developer' }] : []),
+      ...(fullLLMConfig.phases?.security ? [{ config: fullLLMConfig.phases.security, phase: 'security' }] : []),
+    ];
+
+    const configuredProviders = new Set<string>();
+    for (const { config, phase } of uniqueConfigs) {
+      if (config.apiKey) {
+        const providerID = toOpenCodeProvider(config.provider as any);
+        if (!configuredProviders.has(providerID)) {
+          console.log(`[OrchestratorV2] Configuring auth for ${providerID} (from ${phase})`);
+          await openCodeClient.configureProjectAuth(providerID, config.apiKey);
+          configuredProviders.add(providerID);
+        }
+      }
+    }
+
+    // For backwards compatibility, use analysis config as the "main" llmConfig for notifications
+    const llmConfig = analysisLLMConfig;
+
     // Notify frontend
     socketService.toTask(taskId, 'orchestration:start', {
       taskId,
       title: task.title,
-      phases: ['Analysis', 'Developer', 'Merge'],
+      phases: ['Analysis', 'Developer', 'Merge', 'Security Scan'],
+      llm: {
+        provider: llmConfig.providerID,
+        model: llmConfig.modelID,
+        hasPhaseOverrides,
+        phases: hasOverrides ? {
+          analysis: { provider: analysisLLMConfig.providerID, model: analysisLLMConfig.modelID },
+          developer: { provider: developerLLMConfig.providerID, model: developerLLMConfig.modelID },
+          security: { provider: securityLLMConfig.providerID, model: securityLLMConfig.modelID },
+        } : undefined,
+      },
     });
 
     let analysisResult: AnalysisResult | undefined;
@@ -139,6 +208,7 @@ class OrchestratorV2Class {
         projectPath,
         repositories,
         autoApprove,
+        llmConfig: analysisLLMConfig,
       };
 
       analysisResult = await executeAnalysisPhase(analysisContext);
@@ -155,6 +225,24 @@ class OrchestratorV2Class {
       console.log(`[OrchestratorV2] Analysis complete: ${analysisResult.stories.length} stories created`);
       console.log(`[OrchestratorV2] Branch: ${analysisResult.branchName}`);
 
+      // 🔥 PHASE APPROVAL: Wait for user approval before continuing to Developer
+      if (phaseApprovalMode === 'manual') {
+        console.log(`[OrchestratorV2] ⏸️ Waiting for approval of Analysis phase...`);
+        const analysisApproved = await approvalService.requestApproval(
+          taskId,
+          'Analysis',
+          {
+            stories: analysisResult.stories,
+            branchName: analysisResult.branchName,
+            analysis: analysisResult.analysis,
+          }
+        );
+        if (!analysisApproved) {
+          throw new Error('Analysis phase rejected by user');
+        }
+        console.log(`[OrchestratorV2] ✅ Analysis phase approved`);
+      }
+
       // ════════════════════════════════════════════════════════════════
       // PHASE 2: DEVELOPER
       // ════════════════════════════════════════════════════════════════
@@ -169,6 +257,7 @@ class OrchestratorV2Class {
         stories: analysisResult.stories,
         branchName: analysisResult.branchName,
         autoApprove,
+        llmConfig: developerLLMConfig,
       };
 
       developerResult = await executeDeveloperPhase(developerContext);
@@ -191,6 +280,25 @@ class OrchestratorV2Class {
       const approvedCount = developerResult.stories.filter(r => r.verdict === 'approved').length;
       console.log(`[OrchestratorV2] Developer complete: ${approvedCount}/${analysisResult.stories.length} stories approved`);
       console.log(`[OrchestratorV2] Total commits: ${developerResult.totalCommits}`);
+
+      // 🔥 PHASE APPROVAL: Wait for user approval before continuing to Merge
+      if (phaseApprovalMode === 'manual') {
+        console.log(`[OrchestratorV2] ⏸️ Waiting for approval of Developer phase...`);
+        const developerApproved = await approvalService.requestApproval(
+          taskId,
+          'Developer',
+          {
+            stories: developerResult.stories,
+            totalCommits: developerResult.totalCommits,
+            approvedCount,
+            totalStories: analysisResult.stories.length,
+          }
+        );
+        if (!developerApproved) {
+          throw new Error('Developer phase rejected by user');
+        }
+        console.log(`[OrchestratorV2] ✅ Developer phase approved`);
+      }
 
       // ════════════════════════════════════════════════════════════════
       // PHASE 3: MERGE

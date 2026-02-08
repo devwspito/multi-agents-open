@@ -1,0 +1,135 @@
+# Docker Compose for Open Multi-Agents
+#
+# PostgreSQL + Redis for scalable task processing
+# Optimized for DGX Spark deployment with high concurrency
+#
+# Usage:
+#   docker compose up -d          # Start services
+#   docker compose logs -f        # View logs
+#   docker compose down           # Stop services
+#   docker compose down -v        # Stop and remove volumes
+
+version: '3.8'
+
+services:
+  # ==============================================
+  # PostgreSQL - Main Database
+  # ==============================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: oma-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oma}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oma_secure_password}
+      POSTGRES_DB: ${POSTGRES_DB:-open_multi_agents}
+      # Performance tuning for high concurrency
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oma} -d ${POSTGRES_DB:-open_multi_agents}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Optimize PostgreSQL for high concurrency
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+      -c max_worker_processes=4
+      -c max_parallel_workers_per_gather=2
+      -c max_parallel_workers=4
+      -c max_parallel_maintenance_workers=2
+    networks:
+      - oma-network
+
+  # ==============================================
+  # Redis - Queue Backend & Cache
+  # ==============================================
+  redis:
+    image: redis:7-alpine
+    container_name: oma-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --tcp-keepalive 300
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oma-network
+
+  # ==============================================
+  # Redis Commander - Web UI for Redis (Optional)
+  # ==============================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: oma-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: "local:redis:6379"
+    ports:
+      - "${REDIS_COMMANDER_PORT:-8081}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - tools
+    networks:
+      - oma-network
+
+  # ==============================================
+  # BullMQ Board - Queue Dashboard (Optional)
+  # ==============================================
+  bull-board:
+    image: deadly0/bull-board:latest
+    container_name: oma-bull-board
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      BULL_PREFIX: bull
+    ports:
+      - "${BULL_BOARD_PORT:-3001}:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - tools
+    networks:
+      - oma-network
+
+volumes:
+  postgres_data:
+    name: oma-postgres-data
+  redis_data:
+    name: oma-redis-data
+
+networks:
+  oma-network:
+    name: oma-network
+    driver: bridge

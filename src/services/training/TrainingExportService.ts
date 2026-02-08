@@ -10,6 +10,7 @@
 import { AgentExecutionRepository, IAgentExecution } from '../../database/repositories/AgentExecutionRepository.js';
 import { AgentTurnRepository, IAgentTurn } from '../../database/repositories/AgentTurnRepository.js';
 import { ToolCallRepository, IToolCall } from '../../database/repositories/ToolCallRepository.js';
+import { TaskRepository } from '../../database/repositories/TaskRepository.js';
 import { mlSecurityAnalyzer } from './MLSecurityAnalyzer.js';
 import fs from 'fs';
 import path from 'path';
@@ -78,6 +79,19 @@ export interface TrainingDataRecord {
     callOrder: number;
   }>;
 
+  // 🔥 Activity log from real-time events (v2.2.0)
+  // Contains raw frontend events with full tool input/output data
+  // Critical for ML training: includes old_string, new_string, file_path for Edit tools
+  activityLog?: Array<{
+    type: string;
+    content: string;
+    timestamp?: string;
+    tool?: string;
+    toolState?: string;
+    toolInput?: any;   // Full tool input (old_string, new_string, file_path, command, etc.)
+    toolOutput?: any;  // Tool result/output
+  }>;
+
   // ML Security Signals (v2.1.0)
   mlSecuritySignals?: {
     signals: Array<{
@@ -115,20 +129,24 @@ export interface ExportOptions {
 }
 
 class TrainingExportServiceClass {
-  private readonly VERSION = '2.1.0'; // Added ML security signals
+  private readonly VERSION = '2.2.0'; // Added activity_log with full tool input/output for ML training
 
   /**
    * Export training data for a single task
    */
   async exportTask(taskId: string): Promise<TrainingDataRecord> {
-    const executions = AgentExecutionRepository.findByTaskId(taskId);
-    const turns = AgentTurnRepository.findByTaskId(taskId);
-    const toolCalls = ToolCallRepository.findByTaskId(taskId);
+    const executions = await AgentExecutionRepository.findByTaskId(taskId);
+    const turns = await AgentTurnRepository.findByTaskId(taskId);
+    const toolCalls = await ToolCallRepository.findByTaskId(taskId);
 
     const summary = this.calculateSummary(executions, turns, toolCalls);
 
     // Get ML security signals
-    const mlSignalsData = this.getMLSecuritySignals(taskId, executions);
+    const mlSignalsData = await this.getMLSecuritySignals(taskId, executions);
+
+    // 🔥 Get activity_log from task - contains full tool input/output from real-time events
+    // This is critical for ML training: includes old_string, new_string, file_path for Edit tools
+    const activityLog = await this.getActivityLog(taskId);
 
     return {
       id: this.generateExportId(),
@@ -139,17 +157,51 @@ class TrainingExportServiceClass {
       executions: executions.map(e => this.mapExecution(e)),
       turns: turns.map(t => this.mapTurn(t)),
       toolCalls: toolCalls.map(tc => this.mapToolCall(tc)),
+      activityLog,
       mlSecuritySignals: mlSignalsData,
     };
   }
 
   /**
+   * Get activity log from task record
+   * Contains real-time events with full tool input/output data
+   */
+  private async getActivityLog(taskId: string): Promise<TrainingDataRecord['activityLog']> {
+    try {
+      const activityLog = await TaskRepository.getActivityLog(taskId);
+      if (!activityLog || !Array.isArray(activityLog) || activityLog.length === 0) {
+        return undefined;
+      }
+
+      // Filter to only tool-related entries with meaningful data
+      return activityLog
+        .filter((entry: any) =>
+          entry.type === 'tool_call' ||
+          entry.toolInput ||
+          entry.toolOutput
+        )
+        .map((entry: any) => ({
+          type: entry.type,
+          content: entry.content || '',
+          timestamp: entry.timestamp,
+          tool: entry.tool,
+          toolState: entry.toolState,
+          toolInput: entry.toolInput,
+          toolOutput: entry.toolOutput,
+        }));
+    } catch (error: any) {
+      console.warn(`[TrainingExport] Activity log error for task ${taskId}: ${error.message}`);
+      return undefined;
+    }
+  }
+
+  /**
    * Get ML security signals for a task
    */
-  private getMLSecuritySignals(taskId: string, executions: IAgentExecution[]): TrainingDataRecord['mlSecuritySignals'] {
+  private async getMLSecuritySignals(taskId: string, executions: IAgentExecution[]): Promise<TrainingDataRecord['mlSecuritySignals']> {
     try {
-      const signals = mlSecurityAnalyzer.getSignalsForTask(taskId);
-      const summary = mlSecurityAnalyzer.getSignalSummary(taskId);
+      const signals = await mlSecurityAnalyzer.getSignalsForTask(taskId);
+      const summary = await mlSecurityAnalyzer.getSignalSummary(taskId);
 
       // Extract prompt classification
       const promptSignal = signals.find(s => s.signalType === 'prompt_classification');
@@ -203,7 +255,7 @@ class TrainingExportServiceClass {
    * Export multiple tasks as JSONL (JSON Lines) for streaming to DGX
    */
   async exportAsJSONL(options: ExportOptions = {}): Promise<string> {
-    const executions = AgentExecutionRepository.findForTraining({
+    const executions = await AgentExecutionRepository.findForTraining({
       startDate: options.startDate,
       endDate: options.endDate,
       status: options.status === 'all' ? undefined : options.status,
@@ -267,7 +319,7 @@ class TrainingExportServiceClass {
     totalTurns: number;
     totalToolCalls: number;
   }> {
-    const executions = AgentExecutionRepository.findForTraining({
+    const executions = await AgentExecutionRepository.findForTraining({
       startDate: options.startDate,
       endDate: options.endDate,
     });
@@ -277,8 +329,8 @@ class TrainingExportServiceClass {
     let totalToolCalls = 0;
 
     for (const taskId of taskIds) {
-      const turns = AgentTurnRepository.findByTaskId(taskId);
-      const toolCalls = ToolCallRepository.findByTaskId(taskId);
+      const turns = await AgentTurnRepository.findByTaskId(taskId);
+      const toolCalls = await ToolCallRepository.findByTaskId(taskId);
       totalTurns += turns.length;
       totalToolCalls += toolCalls.length;
     }

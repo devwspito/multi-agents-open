@@ -14,7 +14,7 @@
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { db, generateId } from '../../database/index.js';
+import { generateId, postgresService } from '../../database/index.js';
 
 const execAsync = promisify(exec);
 
@@ -335,9 +335,11 @@ class MLSecurityAnalyzerClass {
       }));
     }
 
-    // Persist signals
+    // Persist signals (async, non-blocking)
     for (const signal of signals) {
-      this.persistSignal(signal);
+      this.persistSignal(signal).catch(err =>
+        console.warn(`[MLSecurityAnalyzer] Signal persist failed: ${err.message}`)
+      );
     }
 
     return signals;
@@ -423,7 +425,9 @@ class MLSecurityAnalyzerClass {
       },
     });
 
-    this.persistSignal(signal);
+    this.persistSignal(signal).catch(err =>
+      console.warn(`[MLSecurityAnalyzer] Prompt signal persist failed: ${err.message}`)
+    );
     return signal;
   }
 
@@ -502,7 +506,9 @@ class MLSecurityAnalyzerClass {
       details: gitContext,
     });
 
-    this.persistSignal(signal);
+    this.persistSignal(signal).catch(err =>
+      console.warn(`[MLSecurityAnalyzer] Git context signal persist failed: ${err.message}`)
+    );
     return signal;
   }
 
@@ -556,7 +562,9 @@ class MLSecurityAnalyzerClass {
       },
     });
 
-    this.persistSignal(signal);
+    this.persistSignal(signal).catch(err =>
+      console.warn(`[MLSecurityAnalyzer] Error recovery signal persist failed: ${err.message}`)
+    );
   }
 
   /**
@@ -590,24 +598,23 @@ class MLSecurityAnalyzerClass {
     };
   }
 
-  private persistSignal(signal: IMLSecuritySignal): void {
+  private async persistSignal(signal: IMLSecuritySignal): Promise<void> {
     try {
-      const stmt = db.prepare(`
-        INSERT INTO ml_security_signals (
+      await postgresService.query(
+        `INSERT INTO ml_security_signals (
           id, task_id, execution_id, signal_type, severity,
           description, details, detected_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      stmt.run(
-        signal.id,
-        signal.taskId,
-        signal.executionId || null,
-        signal.signalType,
-        signal.severity,
-        signal.description,
-        JSON.stringify(signal.details),
-        signal.detectedAt.toISOString()
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          signal.id,
+          signal.taskId,
+          signal.executionId || null,
+          signal.signalType,
+          signal.severity,
+          signal.description,
+          signal.details,
+          signal.detectedAt.toISOString(),
+        ]
       );
     } catch (error: any) {
       // Table may not exist yet
@@ -618,21 +625,30 @@ class MLSecurityAnalyzerClass {
   /**
    * Get signals for a task
    */
-  getSignalsForTask(taskId: string): IMLSecuritySignal[] {
+  async getSignalsForTask(taskId: string): Promise<IMLSecuritySignal[]> {
     try {
-      const stmt = db.prepare(`
-        SELECT * FROM ml_security_signals WHERE task_id = ? ORDER BY detected_at ASC
-      `);
-      const rows = stmt.all(taskId) as any[];
+      const result = await postgresService.query<{
+        id: string;
+        task_id: string;
+        execution_id: string | null;
+        signal_type: string;
+        severity: string;
+        description: string;
+        details: any;
+        detected_at: string;
+      }>(
+        `SELECT * FROM ml_security_signals WHERE task_id = $1 ORDER BY detected_at ASC`,
+        [taskId]
+      );
 
-      return rows.map(row => ({
+      return result.rows.map(row => ({
         id: row.id,
         taskId: row.task_id,
         executionId: row.execution_id || undefined,
         signalType: row.signal_type as SignalType,
         severity: row.severity as SignalSeverity,
         description: row.description,
-        details: JSON.parse(row.details || '{}'),
+        details: row.details || {},
         detectedAt: new Date(row.detected_at),
       }));
     } catch {
@@ -643,12 +659,12 @@ class MLSecurityAnalyzerClass {
   /**
    * Get signal summary
    */
-  getSignalSummary(taskId: string): {
+  async getSignalSummary(taskId: string): Promise<{
     total: number;
     bySeverity: Record<SignalSeverity, number>;
     byType: Record<SignalType, number>;
-  } {
-    const signals = this.getSignalsForTask(taskId);
+  }> {
+    const signals = await this.getSignalsForTask(taskId);
 
     const bySeverity: Record<SignalSeverity, number> = {
       critical: 0, high: 0, medium: 0, low: 0, info: 0,

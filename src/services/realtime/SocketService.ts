@@ -12,6 +12,8 @@ class SocketServiceClass {
   private io: Server | null = null;
   private taskRooms: Map<string, Set<string>> = new Map(); // taskId -> socketIds
   private userRooms: Map<string, Set<string>> = new Map(); // userId -> socketIds
+  // 🔥 Callback for when a client joins a task room (used by ApprovalService)
+  private onTaskJoinCallback: ((taskId: string, socketId: string) => void) | null = null;
 
   /**
    * Initialize with HTTP server
@@ -32,7 +34,13 @@ class SocketServiceClass {
           this.taskRooms.set(taskId, new Set());
         }
         this.taskRooms.get(taskId)!.add(socket.id);
-        console.log(`[Socket] ${socket.id} joined task ${taskId}`);
+        const roomSize = this.taskRooms.get(taskId)!.size;
+        console.log(`[Socket] ✅ ${socket.id} joined task ${taskId} (room size: ${roomSize})`);
+
+        // 🔥 Notify callback (used by ApprovalService to resend pending approvals)
+        if (this.onTaskJoinCallback) {
+          this.onTaskJoinCallback(taskId, socket.id);
+        }
       };
 
       // Helper to leave task room
@@ -96,6 +104,23 @@ class SocketServiceClass {
    * Emit to a specific task room
    */
   toTask(taskId: string, event: string, data: any): void {
+    const roomSize = this.taskRooms.get(taskId)?.size || 0;
+
+    // 🔥 Always log phase:approval_required events (critical for debugging)
+    if (event === 'phase:approval_required') {
+      console.log(`[Socket] 🔔 Emitting phase:approval_required to task ${taskId} (room size: ${roomSize})`);
+      if (roomSize === 0) {
+        console.log(`[Socket] ⚠️ WARNING: No clients in task room ${taskId} - approval event will be lost!`);
+      }
+    }
+
+    // Debug: log if anyone is in the room for activity events
+    if (roomSize === 0 && event === 'agent:activity') {
+      // Only log once every 50 events to avoid spam
+      if (Math.random() < 0.02) {
+        console.log(`[Socket] ⚠️ No clients in task room ${taskId} for event ${event}`);
+      }
+    }
     this.io?.to(taskId).emit(event, data);
   }
 
@@ -133,6 +158,15 @@ class SocketServiceClass {
    */
   getConnectedUsersCount(): number {
     return this.userRooms.size;
+  }
+
+  /**
+   * 🔥 Set callback for when a client joins a task room
+   * Used by ApprovalService to resend pending approvals
+   */
+  setOnTaskJoinCallback(callback: (taskId: string, socketId: string) => void): void {
+    this.onTaskJoinCallback = callback;
+    console.log('[Socket] Task join callback registered');
   }
 }
 

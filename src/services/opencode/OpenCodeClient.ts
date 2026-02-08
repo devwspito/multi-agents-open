@@ -15,6 +15,25 @@ export interface OpenCodeConfig {
   directory?: string;
 }
 
+/**
+ * 🔥 MODEL CONFIGURATION
+ * Switch between providers here (Anthropic Claude vs Local Kimi-Dev)
+ *
+ * Environment variables:
+ * - OPENCODE_PROVIDER: 'anthropic' | 'dgx-spark' | 'ollama' (default: 'dgx-spark')
+ * - OPENCODE_MODEL: model ID (default: 'kimi-dev-72b')
+ */
+export const DEFAULT_MODEL = {
+  providerID: process.env.OPENCODE_PROVIDER || 'dgx-spark',
+  modelID: process.env.OPENCODE_MODEL || 'kimi-dev-72b',
+};
+
+// Quick reference for switching:
+// Claude:     { providerID: 'anthropic', modelID: 'claude-sonnet-4-20250514' }
+// Kimi-Dev:   { providerID: 'dgx-spark', modelID: 'kimi-dev-72b' }
+// GLM 4.7:    { providerID: 'dgx-spark', modelID: 'glm-4.7' }
+// DeepSeek:   { providerID: 'dgx-spark', modelID: 'deepseek-r1' }
+
 export interface SessionOptions {
   title: string;
   agent?: string;
@@ -122,6 +141,28 @@ class OpenCodeClientService {
   }
 
   /**
+   * 🔥 Configure provider auth for a specific project
+   * Used when project has custom API key (commercial provider)
+   */
+  async configureProjectAuth(providerID: string, apiKey: string): Promise<boolean> {
+    if (!apiKey) return false;
+
+    const client = this.getClient();
+
+    try {
+      await client.auth.set({
+        providerID,
+        auth: { type: 'api', key: apiKey },
+      });
+      console.log(`[OpenCode] Configured ${providerID} auth for project`);
+      return true;
+    } catch (error: any) {
+      console.warn(`[OpenCode] Failed to set ${providerID} auth: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
    * Connect with automatic retries (runs in background)
    * Will keep trying until connected or maxRetries reached
    */
@@ -197,18 +238,27 @@ class OpenCodeClientService {
     const autoApprove = options.autoApprove !== false; // Default to true
 
     // Build permission rules for auto-approve mode
-    // OpenCode SDK expects PermissionRuleset = Array<PermissionRule>
-    // Each rule needs: permission, pattern (glob), action
+    // OpenCode SDK expects PermissionRuleset = Array<{ permission, pattern, action }>
+    // pattern: '*' matches all patterns, '**' matches all directories recursively
     const permission = autoApprove
       ? [
-          { permission: 'Edit', pattern: '*', action: 'allow' as const },
-          { permission: 'Write', pattern: '*', action: 'allow' as const },
-          { permission: 'Bash', pattern: '*', action: 'allow' as const },
-          { permission: 'WebFetch', pattern: '*', action: 'allow' as const },
-          { permission: 'Read', pattern: '*', action: 'allow' as const },
-          { permission: 'Glob', pattern: '*', action: 'allow' as const },
-          { permission: 'Grep', pattern: '*', action: 'allow' as const },
-          { permission: 'TodoWrite', pattern: '*', action: 'allow' as const },
+          { permission: 'Edit', pattern: '**', action: 'allow' as const },
+          { permission: 'Write', pattern: '**', action: 'allow' as const },
+          { permission: 'Bash', pattern: '**', action: 'allow' as const },
+          { permission: 'WebFetch', pattern: '**', action: 'allow' as const },
+          { permission: 'WebSearch', pattern: '**', action: 'allow' as const },
+          { permission: 'Read', pattern: '**', action: 'allow' as const },
+          { permission: 'Glob', pattern: '**', action: 'allow' as const },
+          { permission: 'Grep', pattern: '**', action: 'allow' as const },
+          { permission: 'TodoWrite', pattern: '**', action: 'allow' as const },
+          { permission: 'TodoRead', pattern: '**', action: 'allow' as const },
+          { permission: 'List', pattern: '**', action: 'allow' as const },
+          { permission: 'Task', pattern: '**', action: 'allow' as const },
+          { permission: 'ExternalDirectory', pattern: '**', action: 'allow' as const },
+          { permission: 'DoomLoop', pattern: '**', action: 'allow' as const },
+          { permission: 'Skill', pattern: '**', action: 'allow' as const },
+          { permission: 'CodeSearch', pattern: '**', action: 'allow' as const },
+          { permission: 'LSP', pattern: '**', action: 'allow' as const },
         ]
       : undefined;
 
@@ -229,6 +279,7 @@ class OpenCodeClientService {
   /**
    * Send a prompt to a session
    * @param options.directory - Working directory (overrides default)
+   * @param options.model - Model to use (defaults to DEFAULT_MODEL)
    */
   async sendPrompt(sessionId: string, text: string, options?: {
     model?: { providerID: string; modelID: string };
@@ -238,34 +289,119 @@ class OpenCodeClientService {
   }): Promise<void> {
     const client = this.getClient();
     const directory = options?.directory || this.config.directory;
+    const model = options?.model || DEFAULT_MODEL;
 
-    await client.session.prompt({
+    console.log(`[OpenCode] Sending prompt (async) to session ${sessionId}...`);
+    console.log(`[OpenCode] Model: ${model.providerID}/${model.modelID}`);
+    console.log(`[OpenCode] Directory: ${directory}`);
+    console.log(`[OpenCode] Prompt length: ${text.length} chars`);
+
+    try {
+      // Use promptAsync to send message and return immediately
+      // We use waitForIdle() separately to track completion via events
+      await client.session.promptAsync({
+        sessionID: sessionId,
+        directory,
+        parts: [{ type: 'text', text }],
+        model,
+        ...(options?.agent && { agent: options.agent }),
+        ...(options?.system && { system: options.system }),
+      });
+      console.log(`[OpenCode] Prompt queued for session ${sessionId}`);
+    } catch (error: any) {
+      console.error(`[OpenCode] Error sending prompt: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Send a prompt with images to a session
+   * Images are converted to base64 Data URLs (no external hosting required)
+   * @param sessionId - The session ID
+   * @param text - The text prompt
+   * @param images - Array of images to include
+   * @param options - Additional options (model, agent, system, directory)
+   */
+  async sendPromptWithImages(
+    sessionId: string,
+    text: string,
+    images: Array<{
+      data: Buffer | string; // Buffer or base64 string
+      mime?: string; // defaults to 'image/png'
+      filename?: string;
+    }>,
+    options?: {
+      model?: { providerID: string; modelID: string };
+      agent?: string;
+      system?: string;
+      directory?: string;
+    }
+  ): Promise<void> {
+    const client = this.getClient();
+    const directory = options?.directory || this.config.directory;
+
+    // Build parts array with text and images
+    const parts: Array<
+      | { type: 'text'; text: string }
+      | { type: 'file'; mime: string; url: string; filename?: string }
+    > = [];
+
+    // Add text part first
+    if (text) {
+      parts.push({ type: 'text', text });
+    }
+
+    // Convert images to FilePartInput with base64 Data URLs
+    for (const image of images) {
+      const mime = image.mime || 'image/png';
+
+      // Convert Buffer to base64 if needed
+      let base64Data: string;
+      if (Buffer.isBuffer(image.data)) {
+        base64Data = image.data.toString('base64');
+      } else {
+        // Assume it's already a base64 string
+        base64Data = image.data;
+      }
+
+      // Create Data URL
+      const dataUrl = `data:${mime};base64,${base64Data}`;
+
+      parts.push({
+        type: 'file',
+        mime,
+        url: dataUrl,
+        ...(image.filename && { filename: image.filename }),
+      });
+    }
+
+    // Use promptAsync for non-blocking behavior
+    const model = options?.model || DEFAULT_MODEL;
+    await client.session.promptAsync({
       sessionID: sessionId,
       directory,
-      parts: [{ type: 'text', text }],
-      ...(options?.model && { model: options.model }),
+      parts,
+      model,
       ...(options?.agent && { agent: options.agent }),
       ...(options?.system && { system: options.system }),
     });
 
-    console.log(`[OpenCode] Sent prompt to session ${sessionId}`);
+    console.log(`[OpenCode] Prompt with ${images.length} image(s) queued for session ${sessionId} (model: ${model.providerID}/${model.modelID})`);
   }
 
   /**
    * Subscribe to events and yield them
-   * @param directory - Optional directory to filter events for (use session's directory)
+   * @param directory - Directory to subscribe to (REQUIRED for session events)
    */
-  async *subscribeToEvents(directory?: string): AsyncGenerator<OpenCodeEvent> {
+  async *subscribeToEvents(directory: string): AsyncGenerator<OpenCodeEvent> {
     const client = this.getClient();
 
-    const eventDirectory = directory || this.config.directory;
-    console.log(`[OpenCode] Subscribing to events for directory: ${eventDirectory || 'default'}`);
+    console.log(`[OpenCode] Subscribing to events for directory: ${directory}`);
 
-    console.log(`[OpenCode] Calling client.event.subscribe()...`);
     const events = await client.event.subscribe({
-      directory: eventDirectory,
+      directory,
     });
-    console.log(`[OpenCode] Subscribe returned, starting event stream iteration...`);
+    console.log(`[OpenCode] Event subscription established for ${directory}`);
 
     // The SDK returns a ServerSentEventsResult with a stream property
     for await (const event of events.stream as AsyncIterable<OpenCodeEvent>) {
@@ -275,47 +411,24 @@ class OpenCodeClientService {
 
   /**
    * Wait for session to become idle (finished processing)
-   * @param directory - REQUIRED: The working directory where the session was created
+   * IMPORTANT: Uses the centralized EventBridge subscription - does NOT create a new subscription
+   * @param directory - The working directory where the session was created (used for logging only now)
    */
   async waitForIdle(sessionId: string, options?: {
     timeout?: number;
     onEvent?: (event: OpenCodeEvent) => void;
     directory?: string;
   }): Promise<OpenCodeEvent[]> {
-    const timeout = options?.timeout || 300000; // 5 minutes default
-    const startTime = Date.now();
-    const events: OpenCodeEvent[] = [];
+    // Import EventBridge dynamically to avoid circular dependency
+    const { openCodeEventBridge } = await import('./OpenCodeEventBridge.js');
 
-    // CRITICAL: Must subscribe to events in the same directory as the session
-    console.log(`[OpenCode] Waiting for session ${sessionId} to become idle (dir: ${options?.directory || 'default'})`);
+    console.log(`[OpenCode] Waiting for session ${sessionId} to become idle via EventBridge (dir: ${options?.directory || 'default'})`);
 
-    for await (const event of this.subscribeToEvents(options?.directory)) {
-      events.push(event);
-      options?.onEvent?.(event);
-
-      // Check for completion
-      if (event.type === 'session.idle') {
-        const idleSessionId = event.properties?.sessionID;
-        if (idleSessionId === sessionId) {
-          return events;
-        }
-      }
-
-      // Check for error
-      if (event.type === 'session.error') {
-        const errorSessionId = event.properties?.sessionID;
-        if (errorSessionId === sessionId) {
-          throw new Error(`Session error: ${event.properties?.error}`);
-        }
-      }
-
-      // Check timeout
-      if (Date.now() - startTime > timeout) {
-        throw new Error(`Session ${sessionId} timed out after ${timeout}ms`);
-      }
-    }
-
-    return events;
+    // Use the centralized EventBridge - NO additional subscription created
+    return openCodeEventBridge.waitForSessionIdle(sessionId, {
+      timeout: options?.timeout,
+      onEvent: options?.onEvent,
+    });
   }
 
   /**

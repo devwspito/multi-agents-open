@@ -44,15 +44,15 @@ class ExecutionTrackerService {
   /**
    * Start tracking a new agent execution
    */
-  startExecution(params: {
+  async startExecution(params: {
     taskId: string;
     agentType: string;
     modelId: string;
     phaseName?: string;
     prompt: string;
     workspacePath?: string;
-  }): string {
-    const execution = AgentExecutionRepository.create(params);
+  }): Promise<string> {
+    const execution = await AgentExecutionRepository.create(params);
 
     this.activeExecutions.set(params.taskId, {
       executionId: execution.id,
@@ -99,7 +99,7 @@ class ExecutionTrackerService {
   /**
    * Record a new turn starting
    */
-  startTurn(taskId: string, turnType: TurnType = 'assistant'): string | null {
+  async startTurn(taskId: string, turnType: TurnType = 'assistant'): Promise<string | null> {
     const active = this.activeExecutions.get(taskId);
     if (!active) {
       console.warn(`[ExecutionTracker] No active execution for task ${taskId}`);
@@ -108,7 +108,7 @@ class ExecutionTrackerService {
 
     active.currentTurnNumber++;
 
-    const turn = AgentTurnRepository.create({
+    const turn = await AgentTurnRepository.create({
       executionId: active.executionId,
       taskId,
       turnNumber: active.currentTurnNumber,
@@ -117,7 +117,7 @@ class ExecutionTrackerService {
 
     active.currentTurnId = turn.id;
 
-    AgentExecutionRepository.updateProgress(active.executionId, active.currentTurnNumber);
+    await AgentExecutionRepository.updateProgress(active.executionId, active.currentTurnNumber);
 
     return turn.id;
   }
@@ -125,30 +125,30 @@ class ExecutionTrackerService {
   /**
    * Update current turn with content
    */
-  updateTurnContent(taskId: string, content: string, tokens?: { input: number; output: number }): void {
+  async updateTurnContent(taskId: string, content: string, tokens?: { input: number; output: number }): Promise<void> {
     const active = this.activeExecutions.get(taskId);
     if (!active?.currentTurnId) return;
 
-    AgentTurnRepository.updateContent(active.currentTurnId, content, tokens);
+    await AgentTurnRepository.updateContent(active.currentTurnId, content, tokens);
   }
 
   /**
    * Record a tool call starting
    */
-  startToolCall(taskId: string, params: {
+  async startToolCall(taskId: string, params: {
     toolName: string;
     toolUseId: string;
     toolInput: any;
-  }): string | null {
+  }): Promise<string | null> {
     const active = this.activeExecutions.get(taskId);
     if (!active?.currentTurnId) {
       console.warn(`[ExecutionTracker] No active turn for task ${taskId}`);
       return null;
     }
 
-    const callOrder = ToolCallRepository.getNextCallOrder(active.currentTurnId);
+    const callOrder = await ToolCallRepository.getNextCallOrder(active.currentTurnId);
 
-    const toolCall = ToolCallRepository.create({
+    const toolCall = await ToolCallRepository.create({
       executionId: active.executionId,
       turnId: active.currentTurnId,
       taskId,
@@ -161,7 +161,7 @@ class ExecutionTrackerService {
     active.pendingToolCalls.set(params.toolUseId, toolCall.id);
 
     const currentCount = active.pendingToolCalls.size;
-    AgentTurnRepository.updateToolCalls(active.currentTurnId, currentCount);
+    await AgentTurnRepository.updateToolCalls(active.currentTurnId, currentCount);
 
     // ML: Track tool sequence for chain analysis (async, non-blocking)
     this.trackToolCallMLAsync(taskId, active.executionId, params.toolName, params.toolInput);
@@ -189,14 +189,14 @@ class ExecutionTrackerService {
   /**
    * Record a tool call completing
    */
-  completeToolCall(taskId: string, params: {
+  async completeToolCall(taskId: string, params: {
     toolUseId: string;
     toolName?: string;
     toolOutput?: string;
     toolSuccess: boolean;
     toolError?: string;
     bashExitCode?: number;
-  }): void {
+  }): Promise<void> {
     const active = this.activeExecutions.get(taskId);
     if (!active) return;
 
@@ -206,7 +206,7 @@ class ExecutionTrackerService {
       return;
     }
 
-    ToolCallRepository.complete(toolCallId, {
+    await ToolCallRepository.complete(toolCallId, {
       toolOutput: params.toolOutput,
       toolSuccess: params.toolSuccess,
       toolError: params.toolError,
@@ -225,11 +225,11 @@ class ExecutionTrackerService {
   /**
    * Update turn content - also checks for error recovery
    */
-  updateTurnContentWithRecovery(taskId: string, content: string, tokens?: { input: number; output: number }): void {
+  async updateTurnContentWithRecovery(taskId: string, content: string, tokens?: { input: number; output: number }): Promise<void> {
     const active = this.activeExecutions.get(taskId);
     if (!active?.currentTurnId) return;
 
-    AgentTurnRepository.updateContent(active.currentTurnId, content, tokens);
+    await AgentTurnRepository.updateContent(active.currentTurnId, content, tokens);
 
     // ML: Track error recovery if there was a previous error
     if (active.lastError && content.length > 0) {
@@ -277,16 +277,16 @@ class ExecutionTrackerService {
   /**
    * Complete an execution successfully
    */
-  completeExecution(taskId: string, params: {
+  async completeExecution(taskId: string, params: {
     finalOutput?: string;
     inputTokens: number;
     outputTokens: number;
     costUsd: number;
-  }): void {
+  }): Promise<void> {
     const active = this.activeExecutions.get(taskId);
     if (!active) return;
 
-    AgentExecutionRepository.complete(active.executionId, {
+    await AgentExecutionRepository.complete(active.executionId, {
       ...params,
       turnsCompleted: active.currentTurnNumber,
     });
@@ -313,11 +313,11 @@ class ExecutionTrackerService {
   /**
    * Fail an execution
    */
-  failExecution(taskId: string, errorMessage: string, errorType?: string): void {
+  async failExecution(taskId: string, errorMessage: string, errorType?: string): Promise<void> {
     const active = this.activeExecutions.get(taskId);
     if (!active) return;
 
-    AgentExecutionRepository.fail(active.executionId, errorMessage, errorType);
+    await AgentExecutionRepository.fail(active.executionId, errorMessage, errorType);
 
     // ML: Clear tracking state
     this.clearMLTrackingAsync(active.executionId);
@@ -343,25 +343,25 @@ class ExecutionTrackerService {
   /**
    * Get execution statistics
    */
-  getStats(taskId: string) {
+  async getStats(taskId: string) {
     return {
-      executions: AgentExecutionRepository.getStats(taskId),
-      toolCalls: ToolCallRepository.getStats(taskId),
+      executions: await AgentExecutionRepository.getStats(taskId),
+      toolCalls: await ToolCallRepository.getStats(taskId),
     };
   }
 
   /**
    * Get full execution history for a task
    */
-  getExecutionHistory(taskId: string): {
+  async getExecutionHistory(taskId: string): Promise<{
     executions: IAgentExecution[];
     turns: IAgentTurn[];
     toolCalls: IToolCall[];
-  } {
+  }> {
     return {
-      executions: AgentExecutionRepository.findByTaskId(taskId),
-      turns: AgentTurnRepository.findByTaskId(taskId),
-      toolCalls: ToolCallRepository.findByTaskId(taskId),
+      executions: await AgentExecutionRepository.findByTaskId(taskId),
+      turns: await AgentTurnRepository.findByTaskId(taskId),
+      toolCalls: await ToolCallRepository.findByTaskId(taskId),
     };
   }
 
@@ -375,10 +375,10 @@ class ExecutionTrackerService {
   /**
    * Cancel/cleanup an active execution
    */
-  cancelExecution(taskId: string): void {
+  async cancelExecution(taskId: string): Promise<void> {
     const active = this.activeExecutions.get(taskId);
     if (active) {
-      AgentExecutionRepository.fail(active.executionId, 'Execution cancelled', 'cancelled');
+      await AgentExecutionRepository.fail(active.executionId, 'Execution cancelled', 'cancelled');
       this.activeExecutions.delete(taskId);
     }
   }

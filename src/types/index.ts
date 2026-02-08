@@ -291,3 +291,78 @@ export interface OrchestrationResultV2 {
   /** Total execution time in ms */
   totalExecutionMs: number;
 }
+
+// ============================================================================
+// PROJECT SPECIALISTS CONFIGURATION - Re-export from specialists service
+// ============================================================================
+
+// Stack types for project configuration
+export type FrontendStack = 'react' | 'vue' | 'angular' | 'nextjs' | 'svelte' | 'vanilla';
+export type BackendStack = 'nodejs' | 'python' | 'go' | 'java' | 'rust' | 'dotnet';
+export type DatabaseStack = 'postgresql' | 'mongodb' | 'mysql' | 'redis' | 'sqlite' | 'dynamodb';
+export type InfraStack = 'docker' | 'kubernetes' | 'aws' | 'gcp' | 'azure' | 'vercel';
+
+export type DomainSpecialistType =
+  | 'ui-ux-designer'
+  | 'api-designer'
+  | 'performance-optimizer'
+  | 'accessibility-expert'
+  | 'fullstack-developer';
+
+/**
+ * Stack configuration for a project
+ */
+export interface ProjectStackConfig {
+  frontend?: FrontendStack;
+  backend?: BackendStack;
+  database?: DatabaseStack;
+  infrastructure?: InfraStack;
+  /** Additional frameworks/libraries */
+  additionalTech?: string[];
+}
+
+/**
+ * Standard specialists configuration
+ */
+export interface StandardSpecialistsConfig {
+  contextManager: boolean;
+  taskDecomposition: boolean;
+  codeArchitect: boolean;
+  debugger: boolean;
+  testEngineer: boolean;
+  securityAuditor: boolean;
+  gitFlowManager: boolean;
+}
+
+/**
+ * Complete project specialists configuration
+ * This is stored in Project settings
+ */
+export interface ProjectSpecialistsConfig {
+  /** Stack selection determines which tech specialists are active */
+  stack: ProjectStackConfig;
+  /** Standard specialists (enabled by default) */
+  standard: StandardSpecialistsConfig;
+  /** Additional domain specialists */
+  domainSpecialists?: DomainSpecialistType[];
+  /** Custom specialist IDs (for future extensibility) */
+  customSpecialists?: string[];
+}
+
+/**
+ * Default specialists configuration
+ */
+export const DEFAULT_PROJECT_SPECIALISTS: ProjectSpecialistsConfig = {
+  stack: {},
+  standard: {
+    contextManager: true,
+    taskDecomposition: true,
+    codeArchitect: true,
+    debugger: true,
+    testEngineer: true,
+    securityAuditor: true,
+    gitFlowManager: true,
+  },
+  domainSpecialists: [],
+  customSpecialists: [],
+};

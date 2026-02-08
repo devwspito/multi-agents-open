@@ -4,6 +4,8 @@
  * Multi-Agent Development Platform powered by OpenCode SDK.
  * OpenCode handles: LLM calls, tools, retries, context management.
  * We handle: Orchestration, tracking, security monitoring, ML export.
+ *
+ * Scalability: PostgreSQL + Redis + BullMQ for high-concurrency task processing.
  */
 
 import 'dotenv/config';
@@ -12,7 +14,6 @@ import cors from 'cors';
 import { Server as SocketIOServer } from 'socket.io';
 import { createServer } from 'http';
 
-import { connectDatabase, closeDatabase } from './database/index.js';
 import { openCodeClient } from './services/opencode/OpenCodeClient.js';
 import { executionTracker } from './services/training/ExecutionTracker.js';
 import { trainingExportService } from './services/training/TrainingExportService.js';
@@ -20,6 +21,18 @@ import { sentinentalWebhook } from './services/training/SentinentalWebhook.js';
 import { TaskRepository } from './database/repositories/TaskRepository.js';
 import { agentSpy } from './services/security/AgentSpy.js';
 import { orchestrator, initializePipelines } from './orchestration/index.js';
+
+// PostgreSQL services
+import { postgresService } from './database/postgres/PostgresService.js';
+import { initializeSchema, recoverStaleTasks } from './database/postgres/schema.js';
+
+// Queue services (optional - enabled via env vars)
+import { redisService } from './services/queue/RedisService.js';
+import { taskQueue } from './services/queue/TaskQueue.js';
+import { taskWorker } from './workers/TaskWorker.js';
+
+// Feature flags
+const USE_QUEUE = process.env.USE_QUEUE === 'true';
 
 const PORT = parseInt(process.env.PORT || '3001');
 
@@ -29,21 +42,31 @@ async function main() {
   console.log(' Powered by OpenCode SDK');
   console.log('='.repeat(60));
 
-  // Initialize database
-  await connectDatabase();
+  // =============================================
+  // DATABASE INITIALIZATION (PostgreSQL)
+  // =============================================
+  console.log('[Startup] Connecting to PostgreSQL...');
+  await postgresService.connect();
+  await initializeSchema();
+  await recoverStaleTasks(); // Recover stale tasks from previous session
+  console.log('[Startup] PostgreSQL ready');
+
+  // =============================================
+  // QUEUE INITIALIZATION (Redis + BullMQ)
+  // =============================================
+  if (USE_QUEUE) {
+    console.log('[Startup] Initializing Redis + BullMQ...');
+    await redisService.connect();
+    await taskQueue.initialize();
+    await taskWorker.initialize();
+    console.log('[Startup] Task queue ready for processing');
+  }
 
   // Initialize pipelines
   initializePipelines();
 
-  // Connect to OpenCode server
-  try {
-    await openCodeClient.connect();
-    console.log('[Server] Connected to OpenCode');
-  } catch (error: any) {
-    console.warn(`[Server] Warning: Could not connect to OpenCode: ${error.message}`);
-    console.warn('[Server] Agent execution will fail until OpenCode is available');
-    console.warn('[Server] Start OpenCode with: opencode serve');
-  }
+  // Connect to OpenCode server (auto-retry in background)
+  openCodeClient.startBackgroundReconnect();
 
   // Create Express app
   const app = express();
@@ -60,130 +83,32 @@ async function main() {
 
   // Health check endpoint
   app.get('/health', async (req, res) => {
-    res.json({
+    const health: any = {
       status: 'ok',
       timestamp: new Date().toISOString(),
+      database: 'postgresql',
+      queue: USE_QUEUE ? 'bullmq' : 'direct',
       opencode: {
         connected: openCodeClient.isConnected(),
       },
-    });
-  });
+    };
 
-  // ===========================================
-  // Task Management Endpoints
-  // ===========================================
-
-  /**
-   * Create a task
-   * POST /api/tasks
-   */
-  app.post('/api/tasks', (req, res) => {
-    try {
-      const { projectId, title, description } = req.body;
-
-      if (!title) {
-        return res.status(400).json({ error: 'Missing required field: title' });
+    // Add queue stats if enabled
+    if (USE_QUEUE) {
+      try {
+        health.queueStats = await taskQueue.getStats();
+      } catch (err) {
+        health.queueStats = { error: 'Failed to get queue stats' };
       }
-
-      const task = TaskRepository.create({ projectId, title, description });
-      res.status(201).json(task);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
     }
+
+    // Add database health
+    health.postgresConnected = postgresService.isConnected();
+
+    res.json(health);
   });
 
-  /**
-   * Get all tasks
-   * GET /api/tasks
-   */
-  app.get('/api/tasks', (req, res) => {
-    try {
-      const { projectId, status, limit, offset } = req.query;
-
-      const tasks = TaskRepository.findAll({
-        projectId: projectId as string,
-        status: status as any,
-        limit: limit ? parseInt(limit as string) : undefined,
-        offset: offset ? parseInt(offset as string) : undefined,
-      });
-
-      res.json(tasks);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  /**
-   * Get a task by ID
-   * GET /api/tasks/:taskId
-   */
-  app.get('/api/tasks/:taskId', (req, res) => {
-    try {
-      const { taskId } = req.params;
-      const task = TaskRepository.findById(taskId);
-
-      if (!task) {
-        return res.status(404).json({ error: 'Task not found' });
-      }
-
-      res.json(task);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  /**
-   * Update a task
-   * PUT /api/tasks/:taskId
-   */
-  app.put('/api/tasks/:taskId', (req, res) => {
-    try {
-      const { taskId } = req.params;
-      const { title, description, status } = req.body;
-
-      const task = TaskRepository.update(taskId, { title, description, status });
-
-      if (!task) {
-        return res.status(404).json({ error: 'Task not found' });
-      }
-
-      res.json(task);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  /**
-   * Delete a task
-   * DELETE /api/tasks/:taskId
-   */
-  app.delete('/api/tasks/:taskId', (req, res) => {
-    try {
-      const { taskId } = req.params;
-      const deleted = TaskRepository.delete(taskId);
-
-      if (!deleted) {
-        return res.status(404).json({ error: 'Task not found' });
-      }
-
-      res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  /**
-   * Get task statistics
-   * GET /api/tasks/stats/summary
-   */
-  app.get('/api/tasks/stats/summary', (req, res) => {
-    try {
-      const stats = TaskRepository.getStats();
-      res.json(stats);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
+  // Task Management Endpoints are in src/api/routes/tasks.ts (with auth)
 
   // ===========================================
   // Orchestration Endpoints (OpenCode-powered)
@@ -202,13 +127,13 @@ async function main() {
       }
 
       // Get task
-      const task = TaskRepository.findById(taskId);
+      const task = await TaskRepository.findById(taskId);
       if (!task) {
         return res.status(404).json({ error: 'Task not found' });
       }
 
       // Update task status
-      TaskRepository.updateStatus(taskId, 'running');
+      await TaskRepository.updateStatus(taskId, 'running');
 
       // Emit start event
       io.to(taskId).emit('pipeline_start', { pipeline, taskId });
@@ -276,9 +201,9 @@ async function main() {
    * Get execution history for a task
    * GET /api/tasks/:taskId/history
    */
-  app.get('/api/tasks/:taskId/history', (req, res) => {
+  app.get('/api/tasks/:taskId/history', async (req, res) => {
     const { taskId } = req.params;
-    const history = executionTracker.getExecutionHistory(taskId);
+    const history = await executionTracker.getExecutionHistory(taskId);
     res.json(history);
   });
 
@@ -286,9 +211,9 @@ async function main() {
    * Get execution statistics for a task
    * GET /api/tasks/:taskId/stats
    */
-  app.get('/api/tasks/:taskId/stats', (req, res) => {
+  app.get('/api/tasks/:taskId/stats', async (req, res) => {
     const { taskId } = req.params;
-    const stats = executionTracker.getStats(taskId);
+    const stats = await executionTracker.getStats(taskId);
     res.json(stats);
   });
 
@@ -397,18 +322,18 @@ async function main() {
    * Get Sentinental webhook status
    * GET /api/sentinental/status
    */
-  app.get('/api/sentinental/status', (req, res) => {
-    res.json(sentinentalWebhook.getStatus());
+  app.get('/api/sentinental/status', async (req, res) => {
+    res.json(await sentinentalWebhook.getStatus());
   });
 
   /**
    * Configure Sentinental webhook
    * POST /api/sentinental/configure
    */
-  app.post('/api/sentinental/configure', (req, res) => {
+  app.post('/api/sentinental/configure', async (req, res) => {
     const { url, apiKey, batchSize, flushIntervalMs, enabled, minSeverity } = req.body;
     sentinentalWebhook.configure({ url, apiKey, batchSize, flushIntervalMs, enabled, minSeverity });
-    res.json({ success: true, status: sentinentalWebhook.getStatus() });
+    res.json({ success: true, status: await sentinentalWebhook.getStatus() });
   });
 
   /**
@@ -418,7 +343,7 @@ async function main() {
   app.post('/api/sentinental/flush', async (req, res) => {
     try {
       await sentinentalWebhook.flush();
-      res.json({ success: true, status: sentinentalWebhook.getStatus() });
+      res.json({ success: true, status: await sentinentalWebhook.getStatus() });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -454,12 +379,26 @@ async function main() {
     console.log('='.repeat(60));
     console.log(` Server running on http://localhost:${PORT}`);
     console.log(' ');
+    console.log(` Mode: PostgreSQL + ${USE_QUEUE ? 'BullMQ Queue' : 'Direct Execution'}`);
+    if (USE_QUEUE) {
+      console.log(` Workers: ${process.env.WORKER_CONCURRENCY || 3} concurrent`);
+    }
+    console.log(' ');
     console.log(' Task Endpoints:');
     console.log('   POST /api/tasks               - Create task');
     console.log('   GET  /api/tasks               - List tasks');
     console.log('   GET  /api/tasks/:id           - Get task');
     console.log('   PUT  /api/tasks/:id           - Update task');
     console.log('   DELETE /api/tasks/:id         - Delete task');
+    if (USE_QUEUE) {
+      console.log(' ');
+      console.log(' Queue Endpoints:');
+      console.log('   GET  /api/tasks/queue/stats   - Queue statistics');
+      console.log('   GET  /api/tasks/:id/queue/position - Queue position');
+      console.log('   GET  /api/tasks/queue/wait-time - Estimated wait time');
+      console.log('   POST /api/tasks/queue/pause   - Pause all queues');
+      console.log('   POST /api/tasks/queue/resume  - Resume all queues');
+    }
     console.log(' ');
     console.log(' Orchestration Endpoints (OpenCode-powered):');
     console.log('   POST /api/orchestration/run   - Run pipeline');
@@ -486,21 +425,32 @@ async function main() {
   });
 
   // Graceful shutdown
-  process.on('SIGINT', async () => {
-    console.log('\n[Server] Shutting down...');
-    await sentinentalWebhook.shutdown();
-    openCodeClient.disconnect();
-    closeDatabase();
-    process.exit(0);
-  });
+  const gracefulShutdown = async () => {
+    console.log('\n[Server] Shutting down gracefully...');
 
-  process.on('SIGTERM', async () => {
-    console.log('\n[Server] Shutting down...');
+    // Stop accepting new tasks
+    if (USE_QUEUE) {
+      console.log('[Shutdown] Stopping workers...');
+      await taskWorker.shutdown();
+      await taskQueue.close();
+      await redisService.disconnect();
+    }
+
+    // Flush ML training data
     await sentinentalWebhook.shutdown();
+
+    // Disconnect from OpenCode
     openCodeClient.disconnect();
-    closeDatabase();
+
+    // Close database connection
+    await postgresService.close();
+
+    console.log('[Shutdown] Complete');
     process.exit(0);
-  });
+  };
+
+  process.on('SIGINT', gracefulShutdown);
+  process.on('SIGTERM', gracefulShutdown);
 }
 
 main().catch((error) => {

@@ -10,6 +10,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { socketService } from '../services/realtime/index.js';
 import { approvalService } from '../services/realtime/index.js';
+import { ptyProxyService } from '../services/realtime/PTYProxyService.js';
 import { initializePipelines } from '../orchestration/index.js';
 
 // Routes
@@ -17,6 +18,7 @@ import authRoutes from './routes/auth.js';
 import projectRoutes from './routes/projects.js';
 import repositoryRoutes from './routes/repositories.js';
 import taskRoutes from './routes/tasks.js';
+import ptyRoutes from './routes/pty.js';
 
 const app: Express = express();
 const httpServer = createServer(app);
@@ -36,6 +38,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/repositories', repositoryRoutes);
 app.use('/api/tasks', taskRoutes);
+app.use('/api/pty', ptyRoutes);
 
 // Error handler
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
@@ -52,9 +55,18 @@ app.use((req: Request, res: Response) => {
  * Start the server
  */
 export async function startServer(port = 3000): Promise<void> {
-  // Initialize Socket.io
+  // Initialize Socket.io (notifications)
   socketService.init(httpServer);
   approvalService.init();
+
+  // 🔥 Wire up task join callback to resend pending approvals
+  socketService.setOnTaskJoinCallback((taskId, socketId) => {
+    // Check if there's a pending approval for this task and resend it
+    approvalService.resendApprovalRequest(taskId);
+  });
+
+  // Initialize PTY Proxy (terminal streaming)
+  ptyProxyService.init(httpServer);
 
   // Initialize pipelines
   initializePipelines();
@@ -62,7 +74,8 @@ export async function startServer(port = 3000): Promise<void> {
   // Start listening
   httpServer.listen(port, () => {
     console.log(`[API] Server running on http://localhost:${port}`);
-    console.log(`[API] WebSocket available at ws://localhost:${port}`);
+    console.log(`[API] WebSocket available at ws://localhost:${port}/ws/notifications`);
+    console.log(`[API] PTY Terminal available at ws://localhost:${port}/ws/pty`);
   });
 }
 

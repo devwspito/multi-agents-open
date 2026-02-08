@@ -22,7 +22,7 @@ router.use(authMiddleware);
  */
 router.get('/github', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
-  const githubToken = getUserGitHubToken(userId);
+  const githubToken = await getUserGitHubToken(userId);
 
   if (!githubToken) {
     return res.status(401).json({ success: false, error: 'GitHub not connected' });
@@ -64,18 +64,18 @@ router.get('/github', async (req: Request, res: Response) => {
  * GET /api/repositories/project/:projectId
  * Get repositories for a specific project
  */
-router.get('/project/:projectId', (req: Request, res: Response) => {
+router.get('/project/:projectId', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
   const { projectId } = req.params;
 
   try {
     // Verify project belongs to user
-    const project = ProjectRepository.findById(projectId);
+    const project = await ProjectRepository.findById(projectId);
     if (!project || project.userId !== userId) {
       return res.status(404).json({ success: false, error: 'Project not found' });
     }
 
-    const repos = RepositoryRepository.findByProjectId(projectId);
+    const repos = await RepositoryRepository.findByProjectId(projectId);
 
     const transformed = repos.map(repo => ({
       _id: repo.id,
@@ -105,14 +105,14 @@ router.get('/project/:projectId', (req: Request, res: Response) => {
  * POST /api/repositories/project/:projectId
  * Add a repository to a project
  */
-router.post('/project/:projectId', (req: Request, res: Response) => {
+router.post('/project/:projectId', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
   const { projectId } = req.params;
   const { name, description, githubRepoUrl, githubRepoName, githubBranch, type, pathPatterns, executionOrder, dependencies } = req.body;
 
   try {
     // Verify project belongs to user
-    const project = ProjectRepository.findById(projectId);
+    const project = await ProjectRepository.findById(projectId);
     if (!project || project.userId !== userId) {
       return res.status(404).json({ success: false, error: 'Project not found' });
     }
@@ -124,7 +124,7 @@ router.post('/project/:projectId', (req: Request, res: Response) => {
     // Get default config based on type
     const repoConfig = RepositoryRepository.getDefaultConfig(type || 'backend', name);
 
-    const repo = RepositoryRepository.create({
+    const repo = await RepositoryRepository.create({
       name,
       description: description || `Repository ${name}`,
       projectId,
@@ -165,18 +165,18 @@ router.post('/project/:projectId', (req: Request, res: Response) => {
  * GET /api/repositories/:id
  * Get repository by ID
  */
-router.get('/:id', (req: Request, res: Response) => {
+router.get('/:id', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
 
   try {
-    const repo = RepositoryRepository.findById(req.params.id);
+    const repo = await RepositoryRepository.findById(req.params.id);
 
     if (!repo) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     // Verify project belongs to user
-    const project = ProjectRepository.findById(repo.projectId);
+    const project = await ProjectRepository.findById(repo.projectId);
     if (!project || project.userId !== userId) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
@@ -212,25 +212,25 @@ router.get('/:id', (req: Request, res: Response) => {
  * PUT /api/repositories/:id
  * Update repository
  */
-router.put('/:id', (req: Request, res: Response) => {
+router.put('/:id', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
 
   try {
-    const repo = RepositoryRepository.findById(req.params.id);
+    const repo = await RepositoryRepository.findById(req.params.id);
 
     if (!repo) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     // Verify project belongs to user
-    const project = ProjectRepository.findById(repo.projectId);
+    const project = await ProjectRepository.findById(repo.projectId);
     if (!project || project.userId !== userId) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     const { name, description, githubBranch, type, pathPatterns, executionOrder, dependencies, envVariables, isActive } = req.body;
 
-    const updated = RepositoryRepository.update(req.params.id, {
+    const updated = await RepositoryRepository.update(req.params.id, {
       name,
       description,
       githubBranch,
@@ -270,23 +270,23 @@ router.put('/:id', (req: Request, res: Response) => {
  * DELETE /api/repositories/:id
  * Delete repository (soft delete)
  */
-router.delete('/:id', (req: Request, res: Response) => {
+router.delete('/:id', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
 
   try {
-    const repo = RepositoryRepository.findById(req.params.id);
+    const repo = await RepositoryRepository.findById(req.params.id);
 
     if (!repo) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     // Verify project belongs to user
-    const project = ProjectRepository.findById(repo.projectId);
+    const project = await ProjectRepository.findById(repo.projectId);
     if (!project || project.userId !== userId) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
-    RepositoryRepository.delete(req.params.id);
+    await RepositoryRepository.delete(req.params.id);
 
     res.json({ success: true, message: 'Repository deleted successfully' });
   } catch (error: any) {
@@ -301,17 +301,17 @@ router.delete('/:id', (req: Request, res: Response) => {
  */
 router.post('/:id/reconnect', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
-  const githubToken = getUserGitHubToken(userId);
+  const githubToken = await getUserGitHubToken(userId);
 
   try {
-    const repo = RepositoryRepository.findById(req.params.id);
+    const repo = await RepositoryRepository.findById(req.params.id);
 
     if (!repo) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     // Verify project belongs to user
-    const project = ProjectRepository.findById(repo.projectId);
+    const project = await ProjectRepository.findById(repo.projectId);
     if (!project || project.userId !== userId) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
@@ -329,7 +329,7 @@ router.post('/:id/reconnect', async (req: Request, res: Response) => {
     }
 
     // Update last synced time
-    RepositoryRepository.updateLastSynced(repo.id);
+    await RepositoryRepository.updateLastSynced(repo.id);
 
     res.json({
       success: true,
@@ -360,20 +360,20 @@ router.get('/:id/env', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
 
   try {
-    const repo = RepositoryRepository.findById(req.params.id);
+    const repo = await RepositoryRepository.findById(req.params.id);
 
     if (!repo) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     // Verify project belongs to user
-    const project = ProjectRepository.findById(repo.projectId);
+    const project = await ProjectRepository.findById(repo.projectId);
     if (!project || project.userId !== userId) {
       return res.status(403).json({ success: false, error: 'Access denied' });
     }
 
     // Get decrypted env variables
-    const envVariables = RepositoryRepository.getDecryptedEnvVariables(req.params.id);
+    const envVariables = await RepositoryRepository.getDecryptedEnvVariables(req.params.id);
 
     res.json({
       success: true,
@@ -397,14 +397,14 @@ router.put('/:id/env', async (req: Request, res: Response) => {
   const { envVariables } = req.body;
 
   try {
-    const repo = RepositoryRepository.findById(req.params.id);
+    const repo = await RepositoryRepository.findById(req.params.id);
 
     if (!repo) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     // Verify project belongs to user
-    const project = ProjectRepository.findById(repo.projectId);
+    const project = await ProjectRepository.findById(repo.projectId);
     if (!project || project.userId !== userId) {
       return res.status(403).json({ success: false, error: 'Access denied' });
     }
@@ -423,7 +423,7 @@ router.put('/:id/env', async (req: Request, res: Response) => {
     const preparedEnvVars = EnvService.prepareForStorage(envVariables || []);
 
     // Update repository
-    RepositoryRepository.update(req.params.id, {
+    await RepositoryRepository.update(req.params.id, {
       envVariables: preparedEnvVars,
     });
 
@@ -450,20 +450,20 @@ router.delete('/:id/env', async (req: Request, res: Response) => {
   const userId = (req as any).userId;
 
   try {
-    const repo = RepositoryRepository.findById(req.params.id);
+    const repo = await RepositoryRepository.findById(req.params.id);
 
     if (!repo) {
       return res.status(404).json({ success: false, error: 'Repository not found' });
     }
 
     // Verify project belongs to user
-    const project = ProjectRepository.findById(repo.projectId);
+    const project = await ProjectRepository.findById(repo.projectId);
     if (!project || project.userId !== userId) {
       return res.status(403).json({ success: false, error: 'Access denied' });
     }
 
     // Clear env variables
-    RepositoryRepository.update(req.params.id, {
+    await RepositoryRepository.update(req.params.id, {
       envVariables: [],
     });
 
@@ -484,6 +484,6 @@ export default router;
 /**
  * Get repository by ID (for other modules)
  */
-export function getRepository(repoId: string): IRepository | undefined {
-  return RepositoryRepository.findById(repoId) || undefined;
+export async function getRepository(repoId: string): Promise<IRepository | undefined> {
+  return await RepositoryRepository.findById(repoId) || undefined;
 }
