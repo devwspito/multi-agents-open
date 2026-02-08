@@ -831,6 +831,131 @@ router.post('/detect-stack', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/projects/:id/detect-stack
+ * Auto-detect stack from project's repositories and update settings
+ * Used for existing projects to configure specialists
+ */
+router.post('/:id/detect-stack', async (req: Request, res: Response) => {
+  const userId = (req as any).userId;
+  const projectId = req.params.id;
+
+  try {
+    // Get project
+    const project = await ProjectRepository.findById(projectId);
+    if (!project) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    // Get project's repositories
+    const repositories = await RepositoryRepository.findByProjectId(projectId);
+    if (!repositories || repositories.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No repositories found for this project. Add repositories first.'
+      });
+    }
+
+    console.log(`[Projects] Auto-detecting stack for project ${projectId} (${repositories.length} repos)`);
+
+    // Detect stack for each repository
+    const detectedStacks: any[] = [];
+    for (const repo of repositories) {
+      if (repo.githubRepoUrl) {
+        try {
+          const stack = await specialistManager.detectStackFromRepo(
+            repo.githubRepoUrl,
+            repo.githubBranch || 'main'
+          );
+          detectedStacks.push({
+            repoName: repo.name,
+            stack,
+            summary: buildStackSummary(stack)
+          });
+          console.log(`[Projects] Detected stack for ${repo.name}:`, stack);
+        } catch (err: any) {
+          console.warn(`[Projects] Failed to detect stack for ${repo.name}: ${err.message}`);
+        }
+      }
+    }
+
+    if (detectedStacks.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Could not detect stack from any repository'
+      });
+    }
+
+    // Merge detected stacks (priority: first detected wins)
+    const mergedStack: any = {};
+    const additionalTech: string[] = [];
+
+    for (const { stack } of detectedStacks) {
+      if (stack.frontend && !mergedStack.frontend) mergedStack.frontend = stack.frontend;
+      if (stack.backend && !mergedStack.backend) mergedStack.backend = stack.backend;
+      if (stack.database && !mergedStack.database) mergedStack.database = stack.database;
+      if (stack.infrastructure && !mergedStack.infrastructure) mergedStack.infrastructure = stack.infrastructure;
+      if (stack.additionalTech) {
+        additionalTech.push(...stack.additionalTech);
+      }
+    }
+
+    // Unique additional tech
+    mergedStack.additionalTech = [...new Set(additionalTech)];
+
+    // Get recommended specialists
+    const specialists = specialistManager.getActiveSpecialists({
+      stack: mergedStack,
+      standard: {
+        contextManager: true,
+        taskDecomposition: true,
+        codeArchitect: true,
+        debugger: true,
+        testEngineer: true,
+        securityAuditor: true,
+        gitFlowManager: true,
+      },
+      domainSpecialists: [],
+    }, 'developer');
+
+    // Update project settings with detected stack
+    const currentSettings = project.settings || {};
+    const updatedSettings = {
+      ...currentSettings,
+      specialists: {
+        ...currentSettings.specialists,
+        stack: mergedStack,
+        standard: {
+          contextManager: true,
+          taskDecomposition: true,
+          codeArchitect: true,
+          debugger: true,
+          testEngineer: true,
+          securityAuditor: true,
+          gitFlowManager: true,
+        },
+      },
+    };
+
+    await ProjectRepository.updateSettings(projectId, updatedSettings);
+
+    console.log(`[Projects] Updated project ${projectId} with detected stack:`, mergedStack);
+
+    res.json({
+      success: true,
+      data: {
+        stack: mergedStack,
+        specialists,
+        summary: buildStackSummary(mergedStack),
+        detectedFromRepos: detectedStacks.map(d => ({ name: d.repoName, summary: d.summary })),
+      },
+    });
+  } catch (error: any) {
+    console.error('[Projects] Error auto-detecting stack:', error);
+    res.status(500).json({ success: false, error: 'Failed to auto-detect stack' });
+  }
+});
+
+/**
  * Build a human-readable stack summary
  */
 function buildStackSummary(stack: any): string {
