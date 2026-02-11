@@ -206,6 +206,8 @@ export interface SecurityTrainingRecord {
     schemaVersion: '3.0'; // UPGRADED for platino
     /** Source system identifier */
     source: 'open-multi-agents';
+    /** Record type */
+    recordType: 'security';
     /** Agent type that was executing */
     agentType?: string;
     /** Model ID used (if known) */
@@ -359,6 +361,7 @@ class SentinentalWebhookService {
       meta: {
         schemaVersion: '3.0',
         source: 'open-multi-agents',
+        recordType: 'security',
         agentType: meta?.agentType,
         modelId: meta?.modelId,
         traceLevel,

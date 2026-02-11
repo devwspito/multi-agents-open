@@ -132,6 +132,22 @@ export async function initializeSchema(): Promise<void> {
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS stories JSONB;
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pr_number INTEGER;
       ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pr_url TEXT;
+      -- Cost tracking columns
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS total_cost DECIMAL(10, 6) DEFAULT 0;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS total_input_tokens INTEGER DEFAULT 0;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS total_output_tokens INTEGER DEFAULT 0;
+      -- 🔥 RESUME: Columns for task resume after restart
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_phases JSONB DEFAULT '[]'::jsonb;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_phase VARCHAR(64);
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_step INTEGER;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_agent VARCHAR(64);
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_completed_story_index INTEGER;
+      -- 🔥 ACTIVITY LOG: Persisted console activity for page refresh recovery
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS activity_log JSONB DEFAULT '[]'::jsonb;
+      -- 🔥 PLANNING: Store full planning result for ML training
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS planning_result JSONB;
+      -- 🔥 Failure reason - shown to user when task fails
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS failure_reason TEXT;
     EXCEPTION WHEN others THEN NULL;
     END $$;
   `);
@@ -328,6 +344,25 @@ export async function initializeSchema(): Promise<void> {
   await postgresService.query(`CREATE INDEX IF NOT EXISTS idx_queue_jobs_status ON queue_jobs(status)`);
   await postgresService.query(`CREATE INDEX IF NOT EXISTS idx_queue_jobs_queue ON queue_jobs(queue_name, status)`);
   await postgresService.query(`CREATE INDEX IF NOT EXISTS idx_queue_jobs_task ON queue_jobs(task_id)`);
+
+  // ============================================
+  // APPROVAL LOGS TABLE (Audit trail)
+  // ============================================
+  await postgresService.query(`
+    CREATE TABLE IF NOT EXISTS approval_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      task_id VARCHAR(100) NOT NULL,
+      phase VARCHAR(50) NOT NULL,
+      action VARCHAR(20) NOT NULL,
+      user_id VARCHAR(100),
+      client_id VARCHAR(100),
+      metadata JSONB,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    )
+  `);
+  await postgresService.query(`CREATE INDEX IF NOT EXISTS idx_approval_logs_task_id ON approval_logs(task_id)`);
+  await postgresService.query(`CREATE INDEX IF NOT EXISTS idx_approval_logs_user_id ON approval_logs(user_id)`);
+  await postgresService.query(`CREATE INDEX IF NOT EXISTS idx_approval_logs_created_at ON approval_logs(created_at)`);
 
   console.log('[PostgreSQL] Schema initialized successfully');
 }

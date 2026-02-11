@@ -23,17 +23,29 @@ export const QUEUE_NAMES = {
   COMMITS: 'git-commits',
 } as const;
 
+// Valid phases for retry
+export type RetryablePhase = 'Planning' | 'Analysis' | 'Developer' | 'TestGeneration' | 'Merge' | 'GlobalScan';
+
 // Job data types
 export interface TaskJobData {
   taskId: string;
   userId: string;
-  projectId: string;
-  pipelineName: string;
-  workspacePath: string;
-  repositories: RepositoryInfo[];
+  projectId?: string;
+  title?: string;
+  description?: string;
+  repositoryIds?: string[];
+  pipelineName?: string;
+  workspacePath?: string;
+  repositories?: RepositoryInfo[];
   githubToken?: string;
-  approvalMode: 'manual' | 'automatic';
-  priority: number; // 0-100, higher = more priority
+  approvalMode?: 'manual' | 'automatic';
+  priority?: number; // 0-100, higher = more priority
+  // Phase-selective retry options
+  startFromPhase?: RetryablePhase;
+  preserveAnalysis?: boolean;
+  preserveStories?: boolean;
+  // Continuation from previous task
+  continuedFromTaskId?: string;
 }
 
 export interface CommitJobData {
@@ -319,6 +331,50 @@ class TaskQueueServiceClass {
    */
   getPriorityQueue(): Queue<TaskJobData> | null {
     return this.priorityQueue;
+  }
+
+  /**
+   * 🔥 Clean stale jobs on server startup
+   * Removes all active/waiting jobs so they don't auto-resume
+   * Called AFTER queues are initialized but BEFORE workers start
+   */
+  async cleanStaleJobsOnStartup(): Promise<{ cleaned: number; taskIds: string[] }> {
+    if (!this.taskQueue || !this.priorityQueue) {
+      console.warn('[TaskQueue] Queues not initialized, cannot clean stale jobs');
+      return { cleaned: 0, taskIds: [] };
+    }
+
+    const taskIds: string[] = [];
+    let cleaned = 0;
+
+    // Clean main queue - get all non-completed jobs
+    const activeJobs = await this.taskQueue.getJobs(['active', 'waiting', 'delayed']);
+    for (const job of activeJobs) {
+      if (job.data?.taskId) {
+        taskIds.push(job.data.taskId);
+      }
+      await job.remove().catch(() => {});
+      cleaned++;
+    }
+
+    // Clean priority queue
+    const priorityJobs = await this.priorityQueue.getJobs(['active', 'waiting', 'delayed']);
+    for (const job of priorityJobs) {
+      if (job.data?.taskId && !taskIds.includes(job.data.taskId)) {
+        taskIds.push(job.data.taskId);
+      }
+      await job.remove().catch(() => {});
+      cleaned++;
+    }
+
+    if (cleaned > 0) {
+      console.log(`[TaskQueue] 🧹 Cleaned ${cleaned} stale jobs on startup`);
+      console.log(`[TaskQueue] 🧹 Affected task IDs: ${taskIds.join(', ')}`);
+    } else {
+      console.log('[TaskQueue] ✓ No stale jobs to clean');
+    }
+
+    return { cleaned, taskIds };
   }
 }
 

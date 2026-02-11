@@ -30,7 +30,12 @@ async function main() {
   console.log('[Database] Connecting to PostgreSQL...');
   await postgresService.connect();
   await initializeSchema();
-  await recoverStaleTasks();
+  // 🔥 Mark any running/paused tasks as 'interrupted' on server restart
+  // This ensures users see a Play button to manually resume tasks
+  const recoveredCount = await recoverStaleTasks();
+  if (recoveredCount > 0) {
+    console.log(`[Database] ⚠️ ${recoveredCount} task(s) marked as 'interrupted' - users can resume manually`);
+  }
   console.log('[Database] PostgreSQL ready');
 
   // =============================================
@@ -39,6 +44,14 @@ async function main() {
   console.log('[Queue] Connecting to Redis...');
   await redisService.connect();
   await taskQueue.initialize();
+
+  // 🔥 Clean stale BullMQ jobs BEFORE workers start to prevent auto-resume
+  // This ensures tasks marked as 'interrupted' in DB don't get picked up again
+  const { cleaned, taskIds } = await taskQueue.cleanStaleJobsOnStartup();
+  if (cleaned > 0) {
+    console.log(`[Queue] ⚠️ Removed ${cleaned} stale job(s) from queue - manual resume required`);
+  }
+
   await taskWorker.initialize();
   console.log(`[Queue] BullMQ ready (${process.env.WORKER_CONCURRENCY || 3} workers)`);
 

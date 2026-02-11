@@ -40,7 +40,9 @@
       "WebFetch(domain:www.aitmpl.com)",
       "WebFetch(domain:docs.braingrid.ai)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:resources.anthropic.com)"
+      "WebFetch(domain:resources.anthropic.com)",
+      "Bash(npm test:*)",
+      "Bash(find:*)"
     ]
   }
 }

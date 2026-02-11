@@ -11,6 +11,7 @@ import { createServer } from 'http';
 import { socketService } from '../services/realtime/index.js';
 import { approvalService } from '../services/realtime/index.js';
 import { ptyProxyService } from '../services/realtime/PTYProxyService.js';
+import { logger } from '../services/logging/Logger.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -27,6 +28,29 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Request logging middleware
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const start = Date.now();
+  const correlationId = req.headers['x-correlation-id'] as string || `req-${Date.now()}`;
+
+  // Add correlation ID to response
+  res.setHeader('x-correlation-id', correlationId);
+
+  // Log on response finish
+  res.on('finish', () => {
+    const durationMs = Date.now() - start;
+    // Skip health checks from logging to reduce noise
+    if (req.path !== '/health') {
+      logger.request(req.method, req.path, res.statusCode, durationMs, {
+        correlationId,
+        userAgent: req.headers['user-agent']?.substring(0, 100),
+      });
+    }
+  });
+
+  next();
+});
+
 // Health check
 app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -41,7 +65,11 @@ app.use('/api/pty', ptyRoutes);
 
 // Error handler
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-  console.error('[API] Error:', err.message);
+  logger.error('API request error', err, {
+    method: req.method,
+    path: req.path,
+    correlationId: res.getHeader('x-correlation-id') as string,
+  });
   res.status(500).json({ error: err.message });
 });
 
@@ -69,9 +97,12 @@ export async function startServer(port = 3000): Promise<void> {
 
   // Start listening
   httpServer.listen(port, () => {
-    console.log(`[API] Server running on http://localhost:${port}`);
-    console.log(`[API] WebSocket available at ws://localhost:${port}/ws/notifications`);
-    console.log(`[API] PTY Terminal available at ws://localhost:${port}/ws/pty`);
+    logger.info('Server started', {
+      port,
+      websocket: `ws://localhost:${port}/ws/notifications`,
+      pty: `ws://localhost:${port}/ws/pty`,
+      event: 'server_start',
+    });
   });
 }
 

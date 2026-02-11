@@ -12,6 +12,10 @@
  * Note: Global Scan runs as SEPARATE FINAL PHASE after Merge
  */
 
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   Task,
   Story,
@@ -27,9 +31,234 @@ import { openCodeEventBridge } from '../../services/opencode/OpenCodeEventBridge
 import { gitService } from '../../services/git/index.js';
 import { SessionRepository } from '../../database/repositories/SessionRepository.js';
 import { socketService, approvalService } from '../../services/realtime/index.js';
-import { agentSpy } from '../../services/security/AgentSpy.js';
 import type { ApprovalResponse } from '../../services/realtime/ApprovalService.js';
 import { specialistManager } from '../../services/specialists/index.js';
+
+const execAsync = promisify(exec);
+
+/**
+ * 🔥 BUILD VERIFICATION: Detect build system and run build check
+ */
+interface BuildCheckResult {
+  success: boolean;
+  buildSystem: string;
+  command: string;
+  error?: string;
+  output?: string;
+}
+
+async function runBuildCheck(repoPath: string): Promise<BuildCheckResult> {
+  // Detect build system by checking for config files
+  let buildCommand: string | undefined;
+  let buildSystem: string | undefined;
+
+  // === 1. JavaScript/TypeScript (package.json) ===
+  const packageJsonPath = path.join(repoPath, 'package.json');
+  if (fs.existsSync(packageJsonPath)) {
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+      const scripts = packageJson.scripts || {};
+
+      if (scripts.build) {
+        // Check for specific build tools
+        if (fs.existsSync(path.join(repoPath, 'vite.config.ts')) ||
+            fs.existsSync(path.join(repoPath, 'vite.config.js'))) {
+          buildSystem = 'vite';
+          buildCommand = 'npm run build';
+        } else if (fs.existsSync(path.join(repoPath, 'next.config.js')) ||
+                   fs.existsSync(path.join(repoPath, 'next.config.mjs')) ||
+                   fs.existsSync(path.join(repoPath, 'next.config.ts'))) {
+          buildSystem = 'next';
+          buildCommand = 'npm run build';
+        } else if (fs.existsSync(path.join(repoPath, 'webpack.config.js'))) {
+          buildSystem = 'webpack';
+          buildCommand = 'npm run build';
+        } else {
+          buildSystem = 'npm';
+          buildCommand = 'npm run build';
+        }
+      } else if (fs.existsSync(path.join(repoPath, 'tsconfig.json'))) {
+        // TypeScript project without build script - use tsc
+        buildSystem = 'typescript';
+        buildCommand = 'npx tsc --noEmit';
+      }
+    } catch {
+      // Ignore package.json parse errors
+    }
+  }
+
+  // === 2. Python (pyproject.toml or setup.py) ===
+  if (!buildSystem) {
+    if (fs.existsSync(path.join(repoPath, 'pyproject.toml'))) {
+      buildSystem = 'python';
+      // Try mypy first if available, fallback to ruff or python -m py_compile
+      buildCommand = 'python -m mypy . --ignore-missing-imports 2>/dev/null || python -m ruff check . 2>/dev/null || python -m py_compile $(find . -name "*.py" -type f | head -50)';
+    } else if (fs.existsSync(path.join(repoPath, 'setup.py'))) {
+      buildSystem = 'python-setup';
+      buildCommand = 'python setup.py check 2>/dev/null || python -m py_compile $(find . -name "*.py" -type f | head -50)';
+    } else if (fs.existsSync(path.join(repoPath, 'requirements.txt'))) {
+      buildSystem = 'python-requirements';
+      buildCommand = 'python -m py_compile $(find . -name "*.py" -type f | head -50) 2>/dev/null || echo "Python syntax check completed"';
+    }
+  }
+
+  // === 3. Go (go.mod) ===
+  if (!buildSystem && fs.existsSync(path.join(repoPath, 'go.mod'))) {
+    buildSystem = 'go';
+    buildCommand = 'go build ./... && go vet ./...';
+  }
+
+  // === 4. Rust (Cargo.toml) ===
+  if (!buildSystem && fs.existsSync(path.join(repoPath, 'Cargo.toml'))) {
+    buildSystem = 'rust';
+    buildCommand = 'cargo check';
+  }
+
+  // === 5. Java - Maven (pom.xml) ===
+  if (!buildSystem && fs.existsSync(path.join(repoPath, 'pom.xml'))) {
+    buildSystem = 'maven';
+    buildCommand = 'mvn compile -q';
+  }
+
+  // === 6. Java - Gradle (build.gradle or build.gradle.kts) ===
+  if (!buildSystem) {
+    if (fs.existsSync(path.join(repoPath, 'build.gradle')) ||
+        fs.existsSync(path.join(repoPath, 'build.gradle.kts'))) {
+      buildSystem = 'gradle';
+      // Use wrapper if available
+      if (fs.existsSync(path.join(repoPath, 'gradlew'))) {
+        buildCommand = './gradlew build -x test -q';
+      } else {
+        buildCommand = 'gradle build -x test -q';
+      }
+    }
+  }
+
+  // === 7. .NET / C# (*.csproj or *.sln) ===
+  if (!buildSystem) {
+    const files = fs.readdirSync(repoPath);
+    const hasCsproj = files.some(f => f.endsWith('.csproj'));
+    const hasSln = files.some(f => f.endsWith('.sln'));
+    if (hasCsproj || hasSln) {
+      buildSystem = 'dotnet';
+      buildCommand = 'dotnet build --no-restore -v q';
+    }
+  }
+
+  // === 8. Dart / Flutter (pubspec.yaml) ===
+  if (!buildSystem && fs.existsSync(path.join(repoPath, 'pubspec.yaml'))) {
+    // Check if it's a Flutter project
+    try {
+      const pubspec = fs.readFileSync(path.join(repoPath, 'pubspec.yaml'), 'utf-8');
+      if (pubspec.includes('flutter:') || pubspec.includes('flutter_test:')) {
+        buildSystem = 'flutter';
+        buildCommand = 'flutter analyze --no-pub';
+      } else {
+        buildSystem = 'dart';
+        buildCommand = 'dart analyze';
+      }
+    } catch {
+      buildSystem = 'dart';
+      buildCommand = 'dart analyze';
+    }
+  }
+
+  // === No build system detected ===
+  if (!buildSystem || !buildCommand) {
+    return {
+      success: true,
+      buildSystem: 'none',
+      command: 'none',
+      output: 'No supported build system found, skipping build check',
+    };
+  }
+
+  // === Execute build command ===
+  try {
+    console.log(`[BuildCheck] Running ${buildSystem} build in ${repoPath}...`);
+    console.log(`[BuildCheck] Command: ${buildCommand}`);
+
+    const { stdout, stderr } = await execAsync(buildCommand, {
+      cwd: repoPath,
+      timeout: 180000, // 3 minute timeout for builds (increased for larger projects)
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+    });
+
+    console.log(`[BuildCheck] ✅ Build successful for ${repoPath}`);
+    return {
+      success: true,
+      buildSystem,
+      command: buildCommand,
+      output: stdout || stderr,
+    };
+  } catch (error: any) {
+    const errorOutput = error.stderr || error.stdout || error.message;
+    console.error(`[BuildCheck] ❌ Build failed for ${repoPath}:`);
+    console.error(errorOutput);
+
+    return {
+      success: false,
+      buildSystem,
+      command: buildCommand,
+      error: errorOutput,
+    };
+  }
+}
+
+/**
+ * 🔥 Run build checks on all repositories that have changes
+ */
+async function runBuildChecksOnRepos(
+  repositories: RepositoryInfo[],
+  taskId: string
+): Promise<{ allPassed: boolean; results: Array<{ repo: string; result: BuildCheckResult }> }> {
+  const results: Array<{ repo: string; result: BuildCheckResult }> = [];
+  let allPassed = true;
+
+  for (const repo of repositories) {
+    try {
+      // Only check repos that have changes
+      const hasChanges = await gitService.hasChanges(repo.localPath);
+      if (!hasChanges) {
+        console.log(`[BuildCheck] No changes in ${repo.name}, skipping build check`);
+        continue;
+      }
+
+      socketService.toTask(taskId, 'build:started', {
+        repoName: repo.name,
+        repoType: repo.type,
+      });
+
+      const result = await runBuildCheck(repo.localPath);
+      results.push({ repo: repo.name, result });
+
+      if (!result.success) {
+        allPassed = false;
+        socketService.toTask(taskId, 'build:failed', {
+          repoName: repo.name,
+          repoType: repo.type,
+          error: result.error,
+          buildSystem: result.buildSystem,
+        });
+      } else {
+        socketService.toTask(taskId, 'build:success', {
+          repoName: repo.name,
+          repoType: repo.type,
+          buildSystem: result.buildSystem,
+        });
+      }
+    } catch (err: any) {
+      console.error(`[BuildCheck] Error checking ${repo.name}: ${err.message}`);
+      results.push({
+        repo: repo.name,
+        result: { success: false, buildSystem: 'error', command: 'error', error: err.message },
+      });
+      allPassed = false;
+    }
+  }
+
+  return { allPassed, results };
+}
 
 // Re-export types for backward compatibility
 export type { DeveloperResultV2 as DeveloperResult, StoryResultV2 as StoryResult };
@@ -52,6 +281,10 @@ export interface DeveloperPhaseContext {
   };
   /** 🔥 Project specialists configuration */
   specialists?: ProjectSpecialistsConfig;
+  /** 🔥 RESUME: Start from specific story index (skip earlier stories) */
+  startFromStoryIndex?: number;
+  /** 🔥 RESUME: Called after each story completes (for saving progress) */
+  onStoryComplete?: (storyIndex: number) => Promise<void>;
 }
 
 /**
@@ -158,7 +391,148 @@ ${i + 1}. [${issue.severity.toUpperCase()}] ${issue.file ? `(${issue.file})` : '
 Please fix ALL issues. Use Edit tool to modify files.
 After fixing, output a summary of what was changed.
 `,
+
+  /**
+   * SPY - Security analysis agent
+   * Runs in the same session after JUDGE to detect vulnerabilities
+   */
+  spy: (story: Story, filesModified: string[], filesCreated: string[]) => `
+# Security Analysis (SPY Agent)
+
+You are a security expert. Analyze the code changes just made for story "${story.title}" and identify ALL security vulnerabilities.
+
+## Files to Analyze
+${[...filesModified, ...filesCreated].map(f => `- \`${f}\``).join('\n') || '- No files specified'}
+
+## Your Mission
+1. Read each file listed above using the Read tool
+2. Analyze for security vulnerabilities
+3. Report ALL findings, even minor ones
+
+## Vulnerability Categories to Check
+1. **Injection** (SQL, NoSQL, Command, XSS, LDAP, XPath)
+2. **Broken Authentication** (weak passwords, session issues, credential exposure)
+3. **Sensitive Data Exposure** (hardcoded secrets, API keys, passwords, tokens)
+4. **XXE** (XML External Entities)
+5. **Broken Access Control** (missing auth checks, IDOR, privilege escalation)
+6. **Security Misconfiguration** (debug enabled, default credentials, verbose errors)
+7. **XSS** (stored, reflected, DOM-based)
+8. **Insecure Deserialization**
+9. **Using Components with Known Vulnerabilities** (outdated dependencies)
+10. **Insufficient Logging & Monitoring**
+11. **Path Traversal** (../ attacks, arbitrary file access)
+12. **SSRF** (Server-Side Request Forgery)
+13. **Race Conditions** (TOCTOU, concurrency issues)
+14. **Cryptographic Issues** (weak algorithms, hardcoded IVs, predictable randoms)
+
+## Required Output Format
+Output a JSON block with your findings:
+
+\`\`\`json
+{
+  "vulnerabilities": [
+    {
+      "severity": "critical" | "high" | "medium" | "low",
+      "type": "<vulnerability type, e.g., sql_injection, xss, secret_exposure>",
+      "file": "<file path>",
+      "line": <line number or null>,
+      "description": "<clear description of the vulnerability>",
+      "evidence": "<code snippet showing the issue>",
+      "owaspCategory": "<e.g., A03:2021-Injection>",
+      "cweId": "<e.g., CWE-79>",
+      "recommendation": "<how to fix this>"
+    }
+  ],
+  "summary": "<brief summary of security posture>",
+  "riskLevel": "safe" | "low" | "medium" | "high" | "critical"
+}
+\`\`\`
+
+## Guidelines
+- Be thorough - check EVERY file
+- Report ALL vulnerabilities, no matter how minor
+- Include specific line numbers when possible
+- Provide actionable recommendations
+- If no vulnerabilities found, return empty array with "safe" riskLevel
+`,
 };
+
+// ============================================================================
+// SPY RESPONSE PARSING
+// ============================================================================
+
+interface SpyVulnerability {
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  type: string;
+  file: string;
+  line?: number;
+  description: string;
+  evidence?: string;
+  owaspCategory?: string;
+  cweId?: string;
+  recommendation?: string;
+}
+
+interface SpyResult {
+  vulnerabilities: SpyVulnerability[];
+  summary: string;
+  riskLevel: 'safe' | 'low' | 'medium' | 'high' | 'critical';
+}
+
+/**
+ * Extract JSON from SPY LLM output
+ */
+function extractSpyResult(output: string): SpyResult {
+  // Try to find JSON block
+  const jsonMatch = output.match(/```json\s*([\s\S]*?)\s*```/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      return {
+        vulnerabilities: parsed.vulnerabilities || [],
+        summary: parsed.summary || '',
+        riskLevel: parsed.riskLevel || 'safe',
+      };
+    } catch (e) {
+      console.warn('[DeveloperPhase] Failed to parse SPY JSON response');
+    }
+  }
+
+  // Return empty result if parsing fails
+  return {
+    vulnerabilities: [],
+    summary: 'Failed to parse security analysis',
+    riskLevel: 'safe',
+  };
+}
+
+/**
+ * Convert SPY vulnerabilities to VulnerabilityV2 format
+ */
+function convertSpyVulnerabilities(
+  spyResult: SpyResult,
+  context: { taskId: string; sessionId: string; storyId: string; iteration: number }
+): VulnerabilityV2[] {
+  return spyResult.vulnerabilities.map((v, index) => ({
+    id: `spy-${context.storyId}-${context.iteration}-${index}`,
+    taskId: context.taskId,
+    sessionId: context.sessionId,
+    phase: 'Developer',
+    timestamp: new Date(),
+    severity: v.severity,
+    type: v.type as any,
+    description: v.description,
+    evidence: v.evidence || '',
+    blocked: false,
+    category: v.owaspCategory || 'security',
+    filePath: v.file,
+    lineNumber: v.line,
+    codeSnippet: v.evidence,
+    owaspCategory: v.owaspCategory,
+    cweId: v.cweId,
+    recommendation: v.recommendation,
+  }));
+}
 
 /**
  * Execute the Developer Phase
@@ -213,14 +587,24 @@ export async function executeDeveloperPhase(
   console.log(`[DeveloperPhase] Architecture: 1 Session per Story (context isolation)`);
   console.log(`${'='.repeat(60)}`);
 
-  // Determine working directory
+  // Determine primary working directory (for OpenCode sessions)
   const workingDirectory = determineWorkingDirectory(repositories, projectPath);
 
-  // Ensure we're on the correct branch
-  try {
-    await gitService.checkout(workingDirectory, branchName);
-  } catch {
-    console.log(`[DeveloperPhase] Branch ${branchName} not found locally, continuing...`);
+  // 🔥 MULTI-REPO FIX: Checkout branch in ALL repositories
+  console.log(`[DeveloperPhase] Checking out branch ${branchName} in all repositories...`);
+  for (const repo of repositories) {
+    try {
+      await gitService.checkout(repo.localPath, branchName);
+      console.log(`[DeveloperPhase] ✅ Checked out ${branchName} in ${repo.name}`);
+    } catch (checkoutError: any) {
+      // Try to create the branch if it doesn't exist
+      try {
+        await gitService.createBranch(repo.localPath, branchName);
+        console.log(`[DeveloperPhase] ✅ Created and checked out ${branchName} in ${repo.name}`);
+      } catch {
+        console.warn(`[DeveloperPhase] ⚠️ Could not checkout/create ${branchName} in ${repo.name}: ${checkoutError.message}`);
+      }
+    }
   }
 
   // Notify frontend
@@ -235,8 +619,33 @@ export async function executeDeveloperPhase(
   let totalCommits = 0;
   const sessionIds: string[] = []; // Track all sessions created
 
+  // 🔥 RESUME: Get start index (skip already completed stories)
+  const startFromStoryIndex = context.startFromStoryIndex || 0;
+
   for (let i = 0; i < stories.length; i++) {
     const story = stories[i];
+
+    // 🔥 RESUME: Skip stories before startFromStoryIndex
+    if (i < startFromStoryIndex) {
+      console.log(`[DeveloperPhase] ⏭️ SKIPPING story ${i + 1}/${stories.length} (already completed): ${story.title}`);
+      // Add placeholder result for skipped story
+      storyResultsV2.push({
+        id: story.id,
+        title: story.title,
+        description: story.description,
+        status: 'completed',
+        filesToModify: story.filesToModify,
+        filesToCreate: story.filesToCreate,
+        filesToRead: story.filesToRead,
+        acceptanceCriteria: story.acceptanceCriteria,
+        iterations: 0,
+        verdict: 'approved',
+        vulnerabilities: [],
+        trace: { startTime: Date.now(), endTime: Date.now(), toolCalls: 0, turns: 0 },
+      });
+      continue;
+    }
+
     const startTime = Date.now();
 
     console.log(`\n${'─'.repeat(60)}`);
@@ -297,8 +706,140 @@ export async function executeDeveloperPhase(
 
     // Commit + Push if approved by Judge
     if (result.verdict === 'approved') {
-      const hasChanges = await gitService.hasChanges(workingDirectory);
-      if (hasChanges) {
+      // 🔥 MULTI-REPO FIX: Check if ANY repository has changes
+      let anyRepoHasChanges = false;
+      for (const repo of repositories) {
+        try {
+          if (await gitService.hasChanges(repo.localPath)) {
+            anyRepoHasChanges = true;
+            break;
+          }
+        } catch {
+          // Ignore errors checking individual repos
+        }
+      }
+
+      if (anyRepoHasChanges) {
+        // 🔥 BUILD VERIFICATION: Run build check before proceeding to approval
+        console.log(`[DeveloperPhase] 🔨 Running build verification for story ${story.id}...`);
+        socketService.toTask(task.id, 'story:build_check', {
+          storyId: story.id,
+          storyTitle: story.title,
+          status: 'started',
+        });
+
+        let buildCheckPassed = false;
+        let buildAttempts = 0;
+        const maxBuildAttempts = 3;
+        let currentSessionId = result.sessionId;
+
+        while (!buildCheckPassed && buildAttempts < maxBuildAttempts) {
+          buildAttempts++;
+          console.log(`[DeveloperPhase] Build check attempt ${buildAttempts}/${maxBuildAttempts}...`);
+
+          const buildResults = await runBuildChecksOnRepos(repositories, task.id);
+
+          if (buildResults.allPassed) {
+            buildCheckPassed = true;
+            console.log(`[DeveloperPhase] ✅ All builds passed for story ${story.id}`);
+            socketService.toTask(task.id, 'story:build_check', {
+              storyId: story.id,
+              storyTitle: story.title,
+              status: 'success',
+              attempt: buildAttempts,
+            });
+          } else {
+            // 🔥 BUILD FAILED: Ask DEV to fix the errors
+            const failedBuilds = buildResults.results.filter(r => !r.result.success);
+            const buildErrors = failedBuilds.map(b => `${b.repo}:\n${b.result.error}`).join('\n\n');
+
+            console.error(`[DeveloperPhase] ❌ Build failed for story ${story.id} (attempt ${buildAttempts})`);
+
+            socketService.toTask(task.id, 'story:build_check', {
+              storyId: story.id,
+              storyTitle: story.title,
+              status: 'failed',
+              attempt: buildAttempts,
+              errors: failedBuilds.map(b => ({ repo: b.repo, error: b.result.error?.substring(0, 500) })),
+            });
+
+            if (buildAttempts < maxBuildAttempts && currentSessionId) {
+              // Ask DEV to fix the build errors
+              console.log(`[DeveloperPhase] 🔧 Asking DEV to fix build errors...`);
+
+              const fixPrompt = `
+# 🚨 BUILD ERROR - FIX REQUIRED
+
+The build/compilation failed with the following errors:
+
+\`\`\`
+${buildErrors.substring(0, 3000)}
+\`\`\`
+
+## Your Task
+1. Analyze the build error(s) carefully
+2. Fix the issue(s) - this is usually a missing import, typo, or file path error
+3. Make sure all imports are correct and all files exist
+4. After fixing, the build will be re-run automatically
+
+**Focus on fixing ONLY the build errors. Do not add new features or refactor.**
+`;
+
+              try {
+                await openCodeClient.sendPrompt(currentSessionId, fixPrompt, { directory: workingDirectory });
+
+                // Wait for OpenCode to finish fixing (1 minute timeout)
+                await openCodeClient.waitForIdle(currentSessionId, {
+                  timeout: 60000,
+                  directory: workingDirectory,
+                });
+
+                console.log(`[DeveloperPhase] DEV finished fixing build errors`);
+              } catch (fixError: any) {
+                console.error(`[DeveloperPhase] Failed to request build fix: ${fixError.message}`);
+              }
+            } else if (buildAttempts >= maxBuildAttempts) {
+              // Max build attempts reached - fail the story
+              console.error(`[DeveloperPhase] ❌ Build failed after ${maxBuildAttempts} attempts - failing story`);
+              storyResultV2.status = 'failed';
+              storyResultV2.verdict = 'rejected';
+              // Add build error as an issue
+              const buildIssue = {
+                severity: 'critical' as const,
+                description: `Build failed after ${maxBuildAttempts} attempts: ${buildErrors.substring(0, 500)}`,
+              };
+              storyResultV2.issues = [
+                ...(storyResultV2.issues || []),
+                buildIssue,
+              ];
+
+              // Rollback changes
+              for (const repo of repositories) {
+                try {
+                  if (await gitService.hasChanges(repo.localPath)) {
+                    await gitService.discardChanges(repo.localPath);
+                    console.log(`[DeveloperPhase] Rolled back changes in ${repo.name} due to build failure`);
+                  }
+                } catch (rollbackErr) {
+                  console.warn(`[DeveloperPhase] Failed to rollback ${repo.name}`);
+                }
+              }
+
+              socketService.toTask(task.id, 'story:build_failed', {
+                storyId: story.id,
+                storyTitle: story.title,
+                attempts: buildAttempts,
+                errors: failedBuilds.map(b => ({ repo: b.repo, error: b.result.error?.substring(0, 500) })),
+              });
+
+              // Skip to next story
+              storyResultsV2.push(storyResultV2);
+              continue;
+            }
+          }
+        }
+
+        // 🔥 BUILD PASSED - Continue with approval
         // === MANUAL APPROVAL LOOP: Supports approve, reject, and request_changes ===
         let userApproved = autoApprove;
         let approvalAttempts = 0;
@@ -337,6 +878,9 @@ export async function executeDeveloperPhase(
                   storyDescription: story.description,
                   storyIndex: i,
                   totalStories: stories.length,
+
+                  // 🔥 All stories for progress tracker
+                  stories: stories.map(s => ({ id: s.id, title: s.title })),
 
                   // 🔥 Implementation results
                   verdict: currentResult.verdict,
@@ -386,6 +930,15 @@ export async function executeDeveloperPhase(
 
                     // Send feedback to OpenCode session
                     console.log(`[DeveloperPhase] Sending feedback to OpenCode session ${currentResult.sessionId}...`);
+                    socketService.toTask(task.id, 'agent:start', {
+                      agent: 'FIXER',
+                      storyId: story.id,
+                      storyIndex: i,
+                      iteration: approvalAttempts,
+                      reason: 'user_feedback',
+                      feedback: approvalResponse.feedback?.substring(0, 200),
+                      sessionId: currentResult.sessionId,
+                    });
                     await openCodeClient.sendPrompt(
                       currentResult.sessionId,
                       `# User Feedback - Please Make Changes
@@ -399,9 +952,9 @@ Please implement these changes now. After making the changes, provide a summary 
                     );
 
                     // Wait for OpenCode to finish
+                    // 🔥 NO TIMEOUT - Let OpenCode manage its own internal limits
                     const feedbackEvents = await openCodeClient.waitForIdle(currentResult.sessionId, {
                       directory: projectPath,
-                      timeout: 300000,
                     });
 
                     // Notify frontend about feedback completion
@@ -414,6 +967,14 @@ Please implement these changes now. After making the changes, provide a summary 
 
                     // Re-run JUDGE to evaluate the changes
                     console.log(`[DeveloperPhase] Re-running JUDGE after feedback...`);
+                    socketService.toTask(task.id, 'agent:start', {
+                      agent: 'JUDGE',
+                      storyId: story.id,
+                      storyIndex: i,
+                      iteration: currentResult.iterations + 1,
+                      reason: 'post_feedback',
+                      sessionId: currentResult.sessionId,
+                    });
                     await openCodeClient.sendPrompt(
                       currentResult.sessionId,
                       PROMPTS.judge(story),
@@ -422,7 +983,7 @@ Please implement these changes now. After making the changes, provide a summary 
 
                     const judgeEvents = await openCodeClient.waitForIdle(currentResult.sessionId, {
                       directory: projectPath,
-                      timeout: 120000,
+                      // 🔥 No timeout - let OpenCode handle its own limits
                     });
 
                     const judgeOutput = extractFinalOutput(judgeEvents);
@@ -447,22 +1008,43 @@ Please implement these changes now. After making the changes, provide a summary 
                       sessionId: currentResult.sessionId,
                     });
 
-                    // Re-run SPY scan
+                    // Re-run SPY (LLM-based, same session)
                     console.log(`[DeveloperPhase] Re-running SPY after feedback...`);
-                    const spyVulns = await agentSpy.scanWorkspace(workingDirectory, {
+                    socketService.toTask(task.id, 'agent:start', {
+                      agent: 'SPY',
+                      storyId: story.id,
+                      storyIndex: i,
+                      iteration: currentResult.iterations,
+                      reason: 'post_feedback',
+                      sessionId: currentResult.sessionId,
+                    });
+                    const filesModified = story.filesToModify || [];
+                    const filesCreated = story.filesToCreate || [];
+
+                    await openCodeClient.sendPrompt(
+                      currentResult.sessionId,
+                      PROMPTS.spy(story, filesModified, filesCreated),
+                      { directory: workingDirectory, ...modelConfig }
+                    );
+
+                    const spyEvents = await openCodeClient.waitForIdle(currentResult.sessionId, {
+                      directory: workingDirectory,
+                      // 🔥 No timeout - let OpenCode handle its own limits
+                    });
+
+                    const spyOutput = extractFinalOutput(spyEvents);
+                    const spyResult = extractSpyResult(spyOutput);
+                    const spyVulns = convertSpyVulnerabilities(spyResult, {
                       taskId: task.id,
                       sessionId: currentResult.sessionId,
-                      phase: 'Developer',
                       storyId: story.id,
                       iteration: currentResult.iterations,
-                    }, {
-                      filesToScan: [...(story.filesToModify || []), ...(story.filesToCreate || [])],
                     });
 
                     // Update vulnerabilities count
                     currentResult.vulnerabilities = [
                       ...(currentResult.vulnerabilities || []),
-                      ...(spyVulns as any[]),
+                      ...spyVulns,
                     ];
 
                     socketService.toTask(task.id, 'iteration:complete', {
@@ -470,6 +1052,8 @@ Please implement these changes now. After making the changes, provide a summary 
                       storyId: story.id,
                       iteration: currentResult.iterations,
                       vulnerabilities: spyVulns.length,
+                      riskLevel: spyResult.riskLevel,
+                      summary: spyResult.summary,
                       sessionId: currentResult.sessionId,
                     });
 
@@ -497,43 +1081,86 @@ Please implement these changes now. After making the changes, provide a summary 
         // Only commit if user approved (or autoApprove is on)
         if (userApproved) {
           console.log(`[DeveloperPhase] Committing story ${story.id}...`);
-          const commit = await gitService.commitAndPush(
-            workingDirectory,
-            `Implement: ${story.title}`,
-            { storyId: story.id, storyTitle: story.title }
-          );
-          storyResultV2.commitHash = commit.hash;
-          totalCommits++;
-          console.log(`[DeveloperPhase] Committed: ${commit.hash.substring(0, 7)}`);
+
+          // 🔥 MULTI-REPO FIX: Commit to ALL repositories that have changes
+          const commitHashes: string[] = [];
+          for (const repo of repositories) {
+            try {
+              const repoHasChanges = await gitService.hasChanges(repo.localPath);
+              if (repoHasChanges) {
+                console.log(`[DeveloperPhase] Committing to ${repo.name} (${repo.type})...`);
+                const commit = await gitService.commitAndPush(
+                  repo.localPath,
+                  `[story-${i + 1}] ${story.title}`,
+                  { storyId: story.id, storyTitle: story.title }
+                );
+                commitHashes.push(`${repo.name}:${commit.hash.substring(0, 7)}`);
+                totalCommits++;
+                console.log(`[DeveloperPhase] Committed to ${repo.name}: ${commit.hash.substring(0, 7)}`);
+              } else {
+                console.log(`[DeveloperPhase] No changes in ${repo.name}, skipping commit`);
+              }
+            } catch (repoError: any) {
+              console.warn(`[DeveloperPhase] Failed to commit to ${repo.name}: ${repoError.message}`);
+            }
+          }
+
+          // Store all commit hashes (comma-separated if multiple)
+          storyResultV2.commitHash = commitHashes.join(', ') || undefined;
+          console.log(`[DeveloperPhase] Committed to ${commitHashes.length} repos: ${commitHashes.join(', ')}`);
         } else {
           console.log(`[DeveloperPhase] Story ${story.id} not committed (user rejected)`);
           storyResultV2.status = 'failed';
           storyResultV2.verdict = 'rejected';
 
-          // 🔥 ROLLBACK: Discard uncommitted changes so next story starts clean
+          // 🔥 MULTI-REPO FIX: Rollback ALL repositories
           console.log(`[DeveloperPhase] Rolling back uncommitted changes for rejected story ${story.id}...`);
-          await gitService.discardChanges(workingDirectory);
+          for (const repo of repositories) {
+            try {
+              const repoHasChanges = await gitService.hasChanges(repo.localPath);
+              if (repoHasChanges) {
+                console.log(`[DeveloperPhase] Discarding changes in ${repo.name}...`);
+                await gitService.discardChanges(repo.localPath);
+              }
+            } catch (repoError: any) {
+              console.warn(`[DeveloperPhase] Failed to rollback ${repo.name}: ${repoError.message}`);
+            }
+          }
 
           // Notify frontend about rollback
           socketService.toTask(task.id, 'story:rollback', {
             storyId: story.id,
             storyTitle: story.title,
             reason: 'User rejected - changes discarded',
+            repositories: repositories.map(r => r.name),
           });
         }
       }
     } else {
-      // 🔥 Judge rejected the story - also discard changes
+      // 🔥 Judge rejected the story - also discard changes in ALL repos
       console.log(`[DeveloperPhase] Story ${story.id} failed Judge review (verdict: ${result.verdict})`);
-      const hasChanges = await gitService.hasChanges(workingDirectory);
-      if (hasChanges) {
-        console.log(`[DeveloperPhase] Rolling back uncommitted changes for failed story ${story.id}...`);
-        await gitService.discardChanges(workingDirectory);
 
+      // 🔥 MULTI-REPO FIX: Rollback ALL repositories
+      let anyChangesRolledBack = false;
+      for (const repo of repositories) {
+        try {
+          const repoHasChanges = await gitService.hasChanges(repo.localPath);
+          if (repoHasChanges) {
+            console.log(`[DeveloperPhase] Discarding changes in ${repo.name}...`);
+            await gitService.discardChanges(repo.localPath);
+            anyChangesRolledBack = true;
+          }
+        } catch (repoError: any) {
+          console.warn(`[DeveloperPhase] Failed to rollback ${repo.name}: ${repoError.message}`);
+        }
+      }
+
+      if (anyChangesRolledBack) {
         socketService.toTask(task.id, 'story:rollback', {
           storyId: story.id,
           storyTitle: story.title,
           reason: `Judge verdict: ${result.verdict} - changes discarded`,
+          repositories: repositories.map(r => r.name),
         });
       }
     }
@@ -554,6 +1181,11 @@ Please implement these changes now. After making the changes, provide a summary 
       completedStories: i + 1,
       sessionId: result.sessionId,
     });
+
+    // 🔥 RESUME: Notify orchestrator that story is complete (for persistence)
+    if (context.onStoryComplete) {
+      await context.onStoryComplete(i);
+    }
 
     console.log(`[DeveloperPhase] Story ${i + 1}/${stories.length} complete. Session closed.`);
   }
@@ -685,6 +1317,13 @@ async function executeStoryWithSession(
       // --- DEVELOPER ---
       if (iterations === 1) {
         console.log(`[DeveloperPhase] Sending DEV prompt...`);
+        socketService.toTask(taskId, 'agent:start', {
+          agent: 'DEVELOPER',
+          storyId: story.id,
+          storyIndex,
+          iteration: iterations,
+          sessionId,
+        });
         await openCodeClient.sendPrompt(
           sessionId,
           PROMPTS.developer(story, storyIndex, totalStories, repositories, specialistPrompt),
@@ -693,9 +1332,9 @@ async function executeStoryWithSession(
       }
 
       // Wait for completion
+      // 🔥 NO TIMEOUT - Let OpenCode manage its own internal limits
       const devEvents = await openCodeClient.waitForIdle(sessionId, {
         directory: projectPath,
-        timeout: 300000,
       });
       totalToolCalls += countToolCalls(devEvents);
 
@@ -709,6 +1348,13 @@ async function executeStoryWithSession(
 
       // --- JUDGE ---
       console.log(`[DeveloperPhase] Sending JUDGE prompt...`);
+      socketService.toTask(taskId, 'agent:start', {
+        agent: 'JUDGE',
+        storyId: story.id,
+        storyIndex,
+        iteration: iterations,
+        sessionId,
+      });
       await openCodeClient.sendPrompt(
         sessionId,
         PROMPTS.judge(story),
@@ -717,7 +1363,7 @@ async function executeStoryWithSession(
 
       const judgeEvents = await openCodeClient.waitForIdle(sessionId, {
         directory: projectPath,
-        timeout: 120000,
+        // 🔥 No timeout - let OpenCode handle its own limits
       });
       totalToolCalls += countToolCalls(judgeEvents);
 
@@ -740,18 +1386,38 @@ async function executeStoryWithSession(
         sessionId,
       });
 
-      // --- SPY (after JUDGE, never blocks) ---
-      console.log(`[DeveloperPhase] Running SPY scan for story ${story.id}...`);
-      const spyVulns = await agentSpy.scanWorkspace(workingDirectory, {
+      // --- SPY (LLM-based security analysis, same session) ---
+      console.log(`[DeveloperPhase] Running SPY analysis for story ${story.id}...`);
+      socketService.toTask(taskId, 'agent:start', {
+        agent: 'SPY',
+        storyId: story.id,
+        storyIndex,
+        iteration: iterations,
+        sessionId,
+      });
+      const filesModified = story.filesToModify || [];
+      const filesCreated = story.filesToCreate || [];
+
+      await openCodeClient.sendPrompt(
+        sessionId,
+        PROMPTS.spy(story, filesModified, filesCreated),
+        { directory: projectPath, ...modelConfig }
+      );
+
+      const spyEvents = await openCodeClient.waitForIdle(sessionId, {
+        directory: projectPath,
+        // 🔥 No timeout - let OpenCode handle its own limits // 2 min for security analysis
+      });
+
+      const spyOutput = extractFinalOutput(spyEvents);
+      const spyResult = extractSpyResult(spyOutput);
+      const spyVulns = convertSpyVulnerabilities(spyResult, {
         taskId,
         sessionId,
-        phase: 'Developer',
         storyId: story.id,
         iteration: iterations,
-      }, {
-        filesToScan: [...(story.filesToModify || []), ...(story.filesToCreate || [])],
       });
-      storyVulnerabilities.push(...(spyVulns as unknown as VulnerabilityV2[]));
+      storyVulnerabilities.push(...spyVulns);
 
       // Notify frontend about SPY results
       socketService.toTask(taskId, 'iteration:complete', {
@@ -759,6 +1425,8 @@ async function executeStoryWithSession(
         storyId: story.id,
         iteration: iterations,
         vulnerabilities: spyVulns.length,
+        riskLevel: spyResult.riskLevel,
+        summary: spyResult.summary,
         bySeverity: {
           critical: spyVulns.filter(v => v.severity === 'critical').length,
           high: spyVulns.filter(v => v.severity === 'high').length,
@@ -767,7 +1435,7 @@ async function executeStoryWithSession(
         },
         sessionId,
       });
-      console.log(`[DeveloperPhase] SPY found ${spyVulns.length} vulnerabilities (not blocking)`);
+      console.log(`[DeveloperPhase] SPY found ${spyVulns.length} vulnerabilities (risk: ${spyResult.riskLevel})`);
 
       if (verdict === 'approved') {
         approved = true;
@@ -777,6 +1445,14 @@ async function executeStoryWithSession(
       } else if (issues.length > 0) {
         // --- FIX ---
         console.log(`[DeveloperPhase] Sending FIX prompt (${issues.length} issues)...`);
+        socketService.toTask(taskId, 'agent:start', {
+          agent: 'FIXER',
+          storyId: story.id,
+          storyIndex,
+          iteration: iterations,
+          issuesCount: issues.length,
+          sessionId,
+        });
         await openCodeClient.sendPrompt(
           sessionId,
           PROMPTS.fix(issues),

@@ -3,6 +3,7 @@
  *
  * Accumulates costs from OpenCode step_finish events in real-time.
  * Tracks costs per task, session, and story.
+ * Persists final costs to database when task completes.
  *
  * Data structure from OpenCode step_finish:
  * {
@@ -15,6 +16,8 @@
  */
 
 import { socketService } from '../realtime/SocketService.js';
+import { postgresService } from '../../database/postgres/PostgresService.js';
+import { logger } from '../logging/Logger.js';
 
 export interface CostData {
   cost: number;
@@ -105,8 +108,16 @@ class CostTrackerClass {
     this.emitCostUpdate(taskId, taskSummary);
 
     // Log significant cost changes (every $0.01)
-    if (Math.floor(taskSummary.totalCost * 100) !== Math.floor((taskSummary.totalCost - cost) * 100)) {
-      console.log(`[CostTracker] Task ${taskId}: $${taskSummary.totalCost.toFixed(4)} (${taskSummary.totalInputTokens + taskSummary.totalOutputTokens} tokens)`);
+    const prevCostCents = Math.floor((taskSummary.totalCost - cost) * 100);
+    const newCostCents = Math.floor(taskSummary.totalCost * 100);
+    if (newCostCents !== prevCostCents) {
+      logger.cost(taskId, taskSummary.totalCost, taskSummary.totalInputTokens, taskSummary.totalOutputTokens);
+
+      // 🔥 Persist to DB on every $0.01 increment to prevent data loss on server restart
+      // This ensures cost is always recoverable even if server crashes
+      this.persistCostToDb(taskId).catch(err => {
+        logger.error('Failed to persist cost during update', err, { taskId, event: 'cost_persist_failed' });
+      });
     }
   }
 
@@ -122,6 +133,69 @@ class CostTrackerClass {
       sessionsCount: summary.sessions.size,
       lastUpdated: summary.lastUpdated.toISOString(),
     });
+  }
+
+  /**
+   * Save cost to database (call when task completes)
+   */
+  async persistCostToDb(taskId: string): Promise<void> {
+    const taskSummary = this.taskCosts.get(taskId);
+    if (!taskSummary) {
+      return;
+    }
+
+    try {
+      await postgresService.query(
+        `UPDATE tasks SET
+          total_cost = $1,
+          total_input_tokens = $2,
+          total_output_tokens = $3
+         WHERE id = $4`,
+        [
+          taskSummary.totalCost,
+          taskSummary.totalInputTokens,
+          taskSummary.totalOutputTokens,
+          taskId,
+        ]
+      );
+      logger.info('Cost persisted to database', { taskId, cost: taskSummary.totalCost, event: 'cost_persisted' });
+    } catch (error) {
+      logger.error('Failed to persist cost', error as Error, { taskId, event: 'cost_persist_failed' });
+    }
+  }
+
+  /**
+   * Load cost from database (for completed tasks)
+   */
+  async loadCostFromDb(taskId: string): Promise<{
+    totalCost: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+  } | null> {
+    try {
+      const result = await postgresService.query<{
+        total_cost: string | null;
+        total_input_tokens: number | null;
+        total_output_tokens: number | null;
+      }>(
+        `SELECT total_cost, total_input_tokens, total_output_tokens FROM tasks WHERE id = $1`,
+        [taskId]
+      );
+
+      if (result.rows.length === 0) {
+        return null;
+      }
+
+      const row = result.rows[0];
+      return {
+        totalCost: parseFloat(row.total_cost || '0'),
+        totalInputTokens: row.total_input_tokens || 0,
+        totalOutputTokens: row.total_output_tokens || 0,
+      };
+    } catch (error) {
+      logger.error('Failed to load cost from database', error as Error, { taskId, event: 'cost_load_failed' });
+      return null;
+    }
   }
 
   /**
@@ -142,6 +216,39 @@ class CostTrackerClass {
 
   /**
    * Get all sessions costs for a task (for API response)
+   * Checks memory first, then database
+   */
+  async getTaskCostDetailsAsync(taskId: string): Promise<{
+    totalCost: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    sessions: SessionCostSummary[];
+  } | null> {
+    // First check in-memory (for running tasks)
+    const taskSummary = this.taskCosts.get(taskId);
+    if (taskSummary) {
+      return {
+        totalCost: taskSummary.totalCost,
+        totalInputTokens: taskSummary.totalInputTokens,
+        totalOutputTokens: taskSummary.totalOutputTokens,
+        sessions: Array.from(taskSummary.sessions.values()),
+      };
+    }
+
+    // Fall back to database (for completed tasks)
+    const dbCost = await this.loadCostFromDb(taskId);
+    if (dbCost) {
+      return {
+        ...dbCost,
+        sessions: [], // Session details not persisted
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Get all sessions costs for a task (synchronous version for backward compat)
    */
   getTaskCostDetails(taskId: string): {
     totalCost: number;
@@ -164,8 +271,11 @@ class CostTrackerClass {
 
   /**
    * Clear cost data for a task (when task completes)
+   * Persists to DB before clearing from memory
    */
-  clearTask(taskId: string): void {
+  async clearTask(taskId: string): Promise<void> {
+    // Persist to database before clearing
+    await this.persistCostToDb(taskId);
     this.taskCosts.delete(taskId);
   }
 
@@ -176,6 +286,9 @@ class CostTrackerClass {
     return new Map(this.taskCosts);
   }
 }
+
+// Export class for testing
+export { CostTrackerClass };
 
 export const costTracker = new CostTrackerClass();
 export default costTracker;

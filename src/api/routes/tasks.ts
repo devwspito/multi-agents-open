@@ -448,6 +448,173 @@ router.post('/:taskId/continue', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/tasks/:taskId/continue-with-context
+ * Continue a completed/failed task with full context from previous execution
+ *
+ * This creates a NEW task that includes context from the original task.
+ * The orchestrator runs completely fresh but with injected context.
+ *
+ * Body:
+ *   - prompt: string - The new instructions from the user
+ */
+router.post('/:taskId/continue-with-context', async (req: Request, res: Response) => {
+  const userId = (req as any).userId;
+  const originalTaskId = req.params.taskId;
+  const { prompt } = req.body;
+
+  if (!prompt || prompt.trim().length < 5) {
+    return res.status(400).json({
+      error: 'prompt required - describe what you want the AI to do next'
+    });
+  }
+
+  // Get original task
+  const originalTask = await TaskRepository.findById(originalTaskId);
+  if (!originalTask) {
+    return res.status(404).json({ error: 'Original task not found' });
+  }
+
+  // Only allow continuation of completed/failed tasks
+  if (!['completed', 'failed', 'cancelled'].includes(originalTask.status)) {
+    return res.status(400).json({
+      error: `Cannot continue task with status '${originalTask.status}'. Use /continue for paused tasks.`,
+    });
+  }
+
+  // Build context from original task
+  const { buildTaskContext, buildContinuationPrompt } = await import('../../services/context/TaskContextBuilder.js');
+  const context = await buildTaskContext(originalTaskId);
+
+  if (!context) {
+    return res.status(500).json({ error: 'Failed to build context from original task' });
+  }
+
+  // Build the continuation prompt with context
+  const fullPrompt = buildContinuationPrompt(context, prompt.trim());
+
+  // Create new task with context-enriched prompt
+  const newTask = await TaskRepository.create({
+    userId,
+    title: `Continue: ${originalTask.title}`,
+    description: fullPrompt,
+    projectId: originalTask.projectId,
+    repositoryId: originalTask.repositoryId,
+    status: 'pending',
+  });
+
+  // Link to original task in metadata (stored in description for now)
+  console.log(`[Tasks] Created continuation task ${newTask.id} from ${originalTaskId}`);
+
+  // Get project for approval mode
+  const project = await getProject(originalTask.projectId!);
+  if (!project) {
+    return res.status(404).json({ error: 'Project not found' });
+  }
+
+  const githubToken = await getUserGitHubToken(userId);
+
+  // Reuse workspace from original task
+  const workspacePath = path.join(WORKSPACES_DIR, originalTaskId);
+
+  // Get repositories (same as original)
+  const allRepos = await RepositoryRepository.findByProjectId(originalTask.projectId!);
+  const repositories: RepositoryInfo[] = allRepos.map(repo => ({
+    id: repo.id,
+    name: repo.name,
+    type: repo.type,
+    localPath: path.join(workspacePath, repo.name),
+    githubUrl: repo.githubRepoUrl,
+    branch: originalTask.branchName || repo.githubBranch,
+    description: repo.description,
+    executionOrder: repo.executionOrder,
+  }));
+
+  // Connect to OpenCode
+  if (!openCodeClient.isConnected()) {
+    await openCodeClient.connect();
+  }
+
+  // Track execution
+  const execution: TaskExecution = {
+    taskId: newTask.id,
+    sessionId: '',
+    status: 'running',
+    startedAt: new Date(),
+  };
+  executions.set(newTask.id, execution);
+
+  // Update task status
+  await TaskRepository.updateStatus(newTask.id, 'running');
+
+  // Emit to frontend
+  socketService.toTask(newTask.id, 'task:started', {
+    taskId: newTask.id,
+    continuedFrom: originalTaskId,
+  });
+
+  // Emit user's prompt as activity
+  socketService.toTask(newTask.id, 'agent:activity', {
+    id: `user-${Date.now()}`,
+    taskId: newTask.id,
+    type: 'user',
+    content: prompt.trim(),
+    timestamp: new Date(),
+  });
+
+  const approvalMode = project.settings?.approvalMode || 'manual';
+
+  // Queue the task
+  const jobData: TaskJobData = {
+    taskId: newTask.id,
+    userId,
+    projectId: originalTask.projectId!,
+    pipelineName: 'v2',
+    workspacePath,
+    repositories,
+    githubToken,
+    approvalMode: approvalMode as 'manual' | 'automatic',
+    priority: project.settings?.priority || 0,
+    // Pass context for phases to use
+    continuedFromTaskId: originalTaskId,
+  };
+
+  try {
+    const job = await taskQueue.addTask(jobData, {
+      priority: jobData.priority,
+      isPro: project.settings?.isPro || false,
+    });
+
+    const position = await taskQueue.getQueuePosition(newTask.id);
+
+    console.log(`[Tasks] Continuation task ${newTask.id} queued (from ${originalTaskId})`);
+
+    await TaskRepository.updateStatus(newTask.id, 'queued');
+
+    socketService.toTask(newTask.id, 'task:queued', {
+      taskId: newTask.id,
+      jobId: job.id,
+      position,
+      continuedFrom: originalTaskId,
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        taskId: newTask.id,
+        continuedFrom: originalTaskId,
+        jobId: job.id,
+        status: 'queued',
+        position,
+      }
+    });
+  } catch (queueError: any) {
+    console.error(`[Tasks] Failed to queue continuation task:`, queueError.message);
+    await TaskRepository.updateStatus(newTask.id, 'failed');
+    return res.status(500).json({ error: `Failed to queue task: ${queueError.message}` });
+  }
+});
+
+/**
  * POST /api/tasks/:taskId/cancel
  * Cancel task execution (works with both queue and direct mode)
  */
@@ -517,14 +684,144 @@ router.post('/:taskId/retry', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/tasks/:taskId/retry-from/:phase
+ * Phase-selective retry - restart task from a specific phase
+ *
+ * Phases: Planning, Analysis, Developer, TestGeneration, Merge
+ *
+ * Body:
+ * - options: Additional options for the phase execution
+ */
+router.post('/:taskId/retry-from/:phase', async (req: Request, res: Response) => {
+  const { taskId, phase } = req.params;
+  const userId = (req as any).userId;
+  const { options = {} } = req.body;
+
+  const task = await TaskRepository.findById(taskId);
+  if (!task) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  // Validate phase name
+  const validPhases = ['Planning', 'Analysis', 'Developer', 'TestGeneration', 'Merge', 'GlobalScan'];
+  if (!validPhases.includes(phase)) {
+    return res.status(400).json({
+      error: `Invalid phase: ${phase}`,
+      validPhases,
+    });
+  }
+
+  // Check if task has required data for the phase
+  if (phase === 'Developer' && (!task.stories || task.stories.length === 0)) {
+    return res.status(400).json({
+      error: 'Cannot retry from Developer phase - no stories from Analysis phase',
+      suggestion: 'Retry from Analysis phase instead',
+    });
+  }
+
+  if (phase === 'TestGeneration' && (!task.stories || task.stories.length === 0)) {
+    return res.status(400).json({
+      error: 'Cannot retry from TestGeneration phase - no stories available',
+      suggestion: 'Retry from Analysis phase instead',
+    });
+  }
+
+  if ((phase === 'Merge' || phase === 'GlobalScan') && !task.branchName) {
+    return res.status(400).json({
+      error: `Cannot retry from ${phase} phase - no branch created`,
+      suggestion: 'Retry from Analysis phase instead',
+    });
+  }
+
+  try {
+    // Cancel any existing execution
+    const existingExecution = executions.get(taskId);
+    if (existingExecution) {
+      openCodeEventBridge.unregisterSession(existingExecution.sessionId);
+      try {
+        await openCodeClient.abortSession(existingExecution.sessionId);
+      } catch (err) {
+        // Ignore abort errors
+      }
+      executions.delete(taskId);
+    }
+
+    // Get user's GitHub token
+    const githubToken = await getUserGitHubToken(userId);
+
+    // Get project repositories
+    const project = task.projectId ? await getProject(task.projectId) : null;
+    const projectRepos = project ? await RepositoryRepository.findByProjectId(project.id) : [];
+
+    // Build repositories info
+    const repositories: RepositoryInfo[] = projectRepos.map(repo => ({
+      id: repo.id,
+      name: repo.name,
+      type: repo.type || 'backend',
+      localPath: path.join(WORKSPACES_DIR, taskId, repo.name),
+      githubUrl: repo.url,
+      branch: task.branchName || 'main',
+      description: repo.description,
+    }));
+
+    // Update task status
+    await TaskRepository.updateStatus(taskId, 'running');
+
+    // Notify frontend
+    socketService.toTask(taskId, 'task:retry_from_phase', {
+      taskId,
+      phase,
+      startedAt: new Date().toISOString(),
+    });
+
+    // Queue the task with startFromPhase option
+    const jobId = await taskQueue.addTask({
+      taskId,
+      userId,
+      title: task.title,
+      description: task.description || '',
+      projectId: task.projectId || undefined,
+      repositoryIds: projectRepos.map(r => r.id),
+      startFromPhase: phase as any,
+      preserveAnalysis: phase !== 'Analysis' && phase !== 'Planning',
+      preserveStories: phase === 'TestGeneration' || phase === 'Merge' || phase === 'GlobalScan',
+      githubToken,
+      ...options,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        taskId,
+        retryFromPhase: phase,
+        jobId,
+        message: `Task will retry from ${phase} phase`,
+      },
+    });
+  } catch (error: any) {
+    console.error(`[Tasks] Phase-selective retry error:`, error);
+    res.status(500).json({
+      error: 'Failed to retry from phase',
+      message: error.message,
+    });
+  }
+});
+
+/**
  * POST /api/tasks/:taskId/approve/:phase
  * Approve a phase (for manual approval mode)
+ *
+ * Body: { feedback?: string } - Optional feedback/clarification answers (JSON string)
  */
 router.post('/:taskId/approve/:phase', (req: Request, res: Response) => {
   const { taskId, phase } = req.params;
+  const { feedback } = req.body; // 🔥 FIX: Accept feedback for clarifications
 
-  // 🔥 Directly resolve the pending approval instead of emitting to room
-  const resolved = approvalService.resolve(taskId, phase, true);
+  // 🔥 FIX: Use resolveWithAction to pass feedback (for clarification answers)
+  const resolved = approvalService.resolveWithAction(taskId, phase, {
+    action: 'approve',
+    feedback, // May be undefined for regular approvals, JSON string for clarifications
+  });
 
   if (!resolved) {
     console.warn(`[API] No pending approval found for ${taskId}:${phase}`);
@@ -533,7 +830,7 @@ router.post('/:taskId/approve/:phase', (req: Request, res: Response) => {
   // Also emit to frontend for UI update
   socketService.toTask(taskId, 'phase:approved', { taskId, phase });
 
-  res.json({ data: { approved: true, phase, resolved } });
+  res.json({ data: { approved: true, phase, resolved, hasFeedback: !!feedback } });
 });
 
 /**
@@ -637,8 +934,38 @@ router.get('/:taskId/status', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/tasks/:taskId/activities
+ * Get activity history for a task (for reconnecting clients)
+ *
+ * Query params:
+ * - limit: Number of activities to return (default 100)
+ */
+router.get('/:taskId/activities', async (req: Request, res: Response) => {
+  const task = await TaskRepository.findById(req.params.taskId);
+  if (!task) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  const limit = parseInt(req.query.limit as string) || 100;
+
+  // Import activity stream service
+  const { activityStream } = await import('../../services/realtime/ActivityStreamService.js');
+  const activities = activityStream.getHistory(req.params.taskId, limit);
+
+  res.json({
+    success: true,
+    data: {
+      taskId: task.id,
+      activities,
+      count: activities.length,
+    },
+  });
+});
+
+/**
  * GET /api/tasks/:taskId/cost
  * Get real-time cost information for a task
+ * Checks in-memory first (running tasks), then database (completed tasks)
  */
 router.get('/:taskId/cost', async (req: Request, res: Response) => {
   const task = await TaskRepository.findById(req.params.taskId);
@@ -646,7 +973,8 @@ router.get('/:taskId/cost', async (req: Request, res: Response) => {
     return res.status(404).json({ error: 'Task not found' });
   }
 
-  const costDetails = costTracker.getTaskCostDetails(req.params.taskId);
+  // Use async version that checks both memory and database
+  const costDetails = await costTracker.getTaskCostDetailsAsync(req.params.taskId);
 
   res.json({
     success: true,
@@ -1237,5 +1565,148 @@ function formatWaitTime(seconds: number): string {
   if (seconds < 3600) return `${Math.ceil(seconds / 60)}m`;
   return `${Math.floor(seconds / 3600)}h ${Math.ceil((seconds % 3600) / 60)}m`;
 }
+
+// ===========================================
+// TASK EXPORT ENDPOINTS
+// ===========================================
+
+/**
+ * GET /api/tasks/:taskId/export
+ * Export task data as JSON or ZIP
+ *
+ * Query params:
+ * - format: 'json' (default) | 'zip'
+ * - include: comma-separated list: 'task,phases,approval,cost,diff,workspace'
+ */
+router.get('/:taskId/export', async (req: Request, res: Response) => {
+  const task = await TaskRepository.findById(req.params.taskId);
+  if (!task) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  const format = (req.query.format as string) || 'json';
+  const includeStr = (req.query.include as string) || 'task,phases,approval,cost';
+  const includes = new Set(includeStr.split(','));
+
+  try {
+    // Import required repositories dynamically
+    const { ApprovalLogRepository } = await import('../../database/repositories/ApprovalLogRepository.js');
+    const { AgentExecutionRepository } = await import('../../database/repositories/AgentExecutionRepository.js');
+
+    const exportData: Record<string, any> = {
+      exportedAt: new Date().toISOString(),
+      version: '2.0',
+    };
+
+    // Task metadata
+    if (includes.has('task')) {
+      exportData.task = {
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+        branchName: task.branchName,
+        prNumber: task.prNumber,
+        prUrl: task.prUrl,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+      };
+    }
+
+    // Phase results (analysis, stories)
+    if (includes.has('phases')) {
+      exportData.phases = {
+        analysis: task.analysis,
+        stories: task.stories,
+        currentStoryIndex: task.currentStoryIndex,
+      };
+
+      // Include execution history
+      const executions = await AgentExecutionRepository.findByTaskId(task.id);
+      exportData.executions = executions.map(exec => ({
+        id: exec.id,
+        phase: exec.phase,
+        status: exec.status,
+        startedAt: exec.startedAt,
+        completedAt: exec.completedAt,
+        result: exec.result,
+      }));
+    }
+
+    // Approval history
+    if (includes.has('approval')) {
+      const approvalLogs = await ApprovalLogRepository.getByTaskId(task.id);
+      exportData.approvalHistory = approvalLogs;
+    }
+
+    // Cost data
+    if (includes.has('cost')) {
+      const costDetails = await costTracker.getTaskCostDetailsAsync(task.id);
+      exportData.cost = costDetails;
+    }
+
+    // Diff data
+    if (includes.has('diff')) {
+      const workspacePath = path.join(WORKSPACES_DIR, task.id);
+      if (fs.existsSync(workspacePath)) {
+        const { gitService } = await import('../../services/git/GitService.js');
+        const diff = await gitService.getFullDiff(workspacePath, 2000);
+        const files = await gitService.getChangedFiles(workspacePath);
+        exportData.diff = { content: diff, files };
+      }
+    }
+
+    // Return JSON format
+    if (format === 'json') {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="task-${task.id}-export.json"`);
+      return res.json(exportData);
+    }
+
+    // ZIP format - include workspace files
+    if (format === 'zip') {
+      const archiver = await import('archiver').catch(() => null);
+      if (!archiver) {
+        return res.status(501).json({
+          error: 'ZIP export not available',
+          message: 'Install archiver package: npm install archiver',
+        });
+      }
+
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="task-${task.id}-export.zip"`);
+
+      const archive = archiver.default('zip', { zlib: { level: 9 } });
+      archive.pipe(res);
+
+      // Add export data as JSON
+      archive.append(JSON.stringify(exportData, null, 2), { name: 'export.json' });
+
+      // Add workspace files if requested
+      if (includes.has('workspace')) {
+        const workspacePath = path.join(WORKSPACES_DIR, task.id);
+        if (fs.existsSync(workspacePath)) {
+          archive.directory(workspacePath, 'workspace', {
+            // Exclude .git and node_modules for smaller exports
+            ignore: (entryPath: string) =>
+              entryPath.includes('node_modules') ||
+              entryPath.includes('.git/objects'),
+          });
+        }
+      }
+
+      await archive.finalize();
+      return;
+    }
+
+    res.status(400).json({ error: `Unknown format: ${format}` });
+  } catch (error: any) {
+    console.error('[Tasks] Export error:', error);
+    res.status(500).json({
+      error: 'Export failed',
+      message: error.message,
+    });
+  }
+});
 
 export default router;

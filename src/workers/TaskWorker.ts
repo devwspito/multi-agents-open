@@ -17,6 +17,7 @@ import { QUEUE_NAMES, TaskJobData, CommitJobData } from '../services/queue/TaskQ
 import { orchestratorV2 } from '../orchestration/OrchestratorV2.js';
 import { postgresService } from '../database/postgres/PostgresService.js';
 import { socketService } from '../services/realtime/SocketService.js';
+import { costTracker } from '../services/cost/CostTracker.js';
 
 // Worker concurrency (tasks processed in parallel)
 const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || '3');
@@ -79,10 +80,22 @@ class TaskWorkerService {
    * Process a task job
    */
   private async processTask(job: Job<TaskJobData>): Promise<any> {
-    const { taskId, userId, workspacePath, repositories, approvalMode } = job.data;
+    const {
+      taskId,
+      userId,
+      workspacePath,
+      repositories,
+      approvalMode,
+      startFromPhase,
+      preserveAnalysis,
+      preserveStories,
+    } = job.data;
 
     console.log(`[TaskWorker] Processing task ${taskId} (job ${job.id})`);
     console.log(`[TaskWorker] Phase approval mode: ${approvalMode}`);
+    if (startFromPhase) {
+      console.log(`[TaskWorker] Starting from phase: ${startFromPhase} (preserveAnalysis=${preserveAnalysis}, preserveStories=${preserveStories})`);
+    }
 
     // Update task status in database
     await this.updateTaskStatus(taskId, 'running');
@@ -104,10 +117,14 @@ class TaskWorkerService {
 
       // Execute the V2 pipeline
       const result = await orchestratorV2.execute(taskId, {
-        projectPath: workspacePath,
-        repositories,
+        projectPath: workspacePath || '',
+        repositories: repositories || [],
         // Phase approval mode: 'manual' pauses between phases, 'automatic' continues
-        phaseApprovalMode: approvalMode as 'manual' | 'automatic',
+        phaseApprovalMode: (approvalMode as 'manual' | 'automatic') || 'manual',
+        // Phase-selective retry options
+        startFromPhase,
+        preserveAnalysis,
+        preserveStories,
         onAnalysisComplete: (analysisResult) => {
           currentPhaseIndex = 1;
           job.updateProgress(25);
@@ -164,6 +181,9 @@ class TaskWorkerService {
       // Update task status based on result
       await this.updateTaskStatus(taskId, result.success ? 'completed' : 'failed', result);
 
+      // Persist cost to database before clearing from memory
+      await costTracker.persistCostToDb(taskId);
+
       // Notify client
       socketService.emitToUser(userId, 'task:completed', {
         taskId,
@@ -191,6 +211,9 @@ class TaskWorkerService {
 
       // Update task status
       await this.updateTaskStatus(taskId, 'failed', null, errorMessage);
+
+      // Persist cost to database even on failure
+      await costTracker.persistCostToDb(taskId);
 
       // Notify client
       socketService.emitToUser(userId, 'task:failed', {
@@ -278,6 +301,10 @@ class TaskWorkerService {
 
     if (errorMessage) {
       updates.push(`error_message = $${paramIndex}`);
+      values.push(errorMessage);
+      paramIndex++;
+      // 🔥 Also save as failure_reason for frontend display
+      updates.push(`failure_reason = $${paramIndex}`);
       values.push(errorMessage);
       paramIndex++;
     }

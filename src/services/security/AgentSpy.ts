@@ -1557,6 +1557,48 @@ class AgentSpyService {
   }
 
   /**
+   * Create initial metrics object
+   */
+  private createInitialMetrics(): SpyMetrics {
+    return {
+      totalEvents: 0,
+      toolCalls: 0,
+      vulnerabilitiesDetected: 0,
+      bySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
+      byType: {},
+      byCategory: {},
+    };
+  }
+
+  /**
+   * Register an external vulnerability (from TestGenerationPhase security edge cases)
+   * This allows external phases to contribute to the Sentinental trace
+   */
+  registerExternalVulnerability(
+    taskId: string,
+    vulnerability: Omit<Vulnerability, 'id' | 'timestamp'>
+  ): void {
+    const fullVuln: Vulnerability = {
+      ...vulnerability,
+      id: `ext_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      timestamp: new Date(),
+    };
+
+    const existing = this.vulnerabilities.get(taskId) || [];
+    this.vulnerabilities.set(taskId, [...existing, fullVuln]);
+
+    // Update metrics
+    const metrics = this.metrics.get(taskId) || this.createInitialMetrics();
+    metrics.vulnerabilitiesDetected++;
+    metrics.bySeverity[vulnerability.severity]++;
+    metrics.byType[vulnerability.type] = (metrics.byType[vulnerability.type] || 0) + 1;
+    metrics.byCategory[vulnerability.category] = (metrics.byCategory[vulnerability.category] || 0) + 1;
+    this.metrics.set(taskId, metrics);
+
+    console.log(`[AgentSpy] Registered external vulnerability: ${vulnerability.type} (${vulnerability.severity}) from ${vulnerability.phase}`);
+  }
+
+  /**
    * Create an empty GlobalVulnerabilityScan (for error cases)
    */
   static createEmptyGlobalScan(): {

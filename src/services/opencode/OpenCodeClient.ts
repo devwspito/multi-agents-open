@@ -588,6 +588,75 @@ class OpenCodeClientService {
     console.log(`[OpenCode] Deleted session ${sessionId}`);
   }
 
+  /**
+   * Fork a session - creates a new session with full context from the original
+   * This is ideal for "continuing" a completed task with all previous context preserved.
+   *
+   * @param sessionId - The session to fork
+   * @param messageId - Optional: fork from a specific message (defaults to latest)
+   * @param directory - Optional: override directory
+   * @returns The new forked session ID
+   */
+  async forkSession(sessionId: string, options?: {
+    messageId?: string;
+    directory?: string;
+  }): Promise<string> {
+    const client = this.getClient();
+    const directory = options?.directory || this.config.directory;
+
+    console.log(`[OpenCode] Forking session ${sessionId}...`);
+
+    const result = await client.session.fork({
+      sessionID: sessionId,
+      directory,
+      ...(options?.messageId && { messageID: options.messageId }),
+    });
+
+    if (!result.data?.id) {
+      throw new Error(`Failed to fork session ${sessionId}`);
+    }
+
+    console.log(`[OpenCode] Forked session ${sessionId} -> ${result.data.id}`);
+    return result.data.id;
+  }
+
+  /**
+   * Get messages from a session
+   * Useful for extracting context to build continuation prompts
+   */
+  async getSessionMessages(sessionId: string, directory?: string): Promise<any[]> {
+    const client = this.getClient();
+
+    const result = await client.session.messages({
+      sessionID: sessionId,
+      directory: directory || this.config.directory,
+    });
+
+    return result.data || [];
+  }
+
+  /**
+   * Summarize a session (triggers AI compaction)
+   * Note: This returns boolean - the summary is applied to the session internally
+   */
+  async summarizeSession(sessionId: string, options?: {
+    providerID?: string;
+    modelID?: string;
+    directory?: string;
+  }): Promise<boolean> {
+    const client = this.getClient();
+
+    const result = await client.session.summarize({
+      sessionID: sessionId,
+      directory: options?.directory || this.config.directory,
+      providerID: options?.providerID || DEFAULT_MODEL.providerID,
+      modelID: options?.modelID || DEFAULT_MODEL.modelID,
+    });
+
+    console.log(`[OpenCode] Summarized session ${sessionId}: ${result.data}`);
+    return result.data === true;
+  }
+
   // ============================================
   // PERMISSION HANDLING
   // ============================================

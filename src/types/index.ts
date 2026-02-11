@@ -5,18 +5,22 @@
  * OpenCode SDK handles LLM-specific types internally.
  */
 
+// Re-export event types for frontend-backend contract
+export * from './events.js';
+
 /**
  * Task status for orchestration
  */
 export type TaskStatus =
   | 'pending'
-  | 'queued'      // Added to BullMQ queue, waiting for worker
+  | 'queued'               // Added to BullMQ queue, waiting for worker
   | 'running'
+  | 'waiting_for_approval' // Human approval required to proceed
   | 'paused'
   | 'completed'
   | 'failed'
   | 'cancelled'
-  | 'interrupted';  // Server restarted while task was running
+  | 'interrupted';         // Server restarted while task was running
 
 /**
  * Story status for tracking progress
@@ -102,6 +106,49 @@ export interface Task {
   prNumber?: number;
   /** Pull Request URL */
   prUrl?: string;
+  /** 🔥 RESUME: Phases that have been completed (survives restart) */
+  completedPhases?: string[];
+  /** 🔥 RESUME: Current phase being executed */
+  currentPhase?: string;
+  /** 🔥 RESUME: Current step within the phase (for precise resume) */
+  currentStep?: number;
+  /** 🔥 RESUME: Current agent executing the step */
+  currentAgent?: string;
+  /** 🔥 RESUME: Last completed story index (for Developer phase resume) */
+  lastCompletedStoryIndex?: number;
+  /** 🔥 PLANNING: Full planning result for ML training (Sentinental + Specialists) */
+  planningResult?: {
+    uxFlows?: Array<{
+      id: string;
+      name: string;
+      description: string;
+      steps: Array<{ step: number; action: string; screen?: string; component?: string }>;
+      edgeCases: string[];
+      errorHandling: string[];
+    }>;
+    plannedTasks?: Array<{
+      id: string;
+      title: string;
+      description: string;
+      acceptanceCriteria: string[];
+      dependencies: string[];
+      estimatedComplexity: 'low' | 'medium' | 'high';
+      affectedAreas: string[];
+    }>;
+    clarifications?: {
+      questions: Array<{ id: string; question: string; category: string; impact: string }>;
+      answers: Record<string, string>;
+      skipped: boolean;
+    };
+    enrichedPrompt?: string;
+    planningDurationMs?: number;
+  };
+  /** 🔥 COST tracking - recoverable after server restart */
+  totalCost?: number;
+  totalInputTokens?: number;
+  totalOutputTokens?: number;
+  /** 🔥 Failure reason - shown to user when task fails */
+  failureReason?: string;
   createdAt: Date;
   updatedAt: Date;
 }

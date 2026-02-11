@@ -11,3 +11,5 @@ export { AgentTurnRepository, type IAgentTurn, type TurnType } from './AgentTurn
 export { ToolCallRepository, type IToolCall } from './ToolCallRepository.js';
 export { TaskRepository } from './TaskRepository.js';
 export { SentinentalRepository, type ISentinentalTrainingData } from './SentinentalRepository.js';
+export { SessionRepository, type IOpenCodeSession } from './SessionRepository.js';
+export { ApprovalLogRepository, type IApprovalLog } from './ApprovalLogRepository.js';

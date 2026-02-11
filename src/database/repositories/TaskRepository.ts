@@ -42,6 +42,20 @@ interface TaskRow {
   pr_url: string | null;
   created_at: Date;
   updated_at: Date;
+  // 🔥 RESUME fields
+  completed_phases: string[] | null;
+  current_phase: string | null;
+  current_step: number | null;
+  current_agent: string | null;
+  last_completed_story_index: number | null;
+  // 🔥 PLANNING: Store full planning result for ML training
+  planning_result: any | null;
+  // 🔥 COST tracking - persisted for recovery after server restart
+  total_cost: string | null;
+  total_input_tokens: number | null;
+  total_output_tokens: number | null;
+  // 🔥 Failure reason - shown to user when task fails
+  failure_reason: string | null;
 }
 
 function mapRow(row: TaskRow): Task {
@@ -60,6 +74,20 @@ function mapRow(row: TaskRow): Task {
     prUrl: row.pr_url || undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // 🔥 RESUME fields
+    completedPhases: row.completed_phases || undefined,
+    currentPhase: row.current_phase || undefined,
+    currentStep: row.current_step ?? undefined,
+    currentAgent: row.current_agent || undefined,
+    lastCompletedStoryIndex: row.last_completed_story_index ?? undefined,
+    // 🔥 PLANNING: For ML training
+    planningResult: row.planning_result || undefined,
+    // 🔥 COST tracking - recoverable after server restart
+    totalCost: row.total_cost ? parseFloat(row.total_cost) : undefined,
+    totalInputTokens: row.total_input_tokens || undefined,
+    totalOutputTokens: row.total_output_tokens || undefined,
+    // 🔥 Failure reason
+    failureReason: row.failure_reason || undefined,
   };
 }
 
@@ -185,6 +213,16 @@ export class TaskRepository {
   }
 
   /**
+   * 🔥 Set task as failed with reason - shows user why it failed
+   */
+  static async setFailed(id: string, reason: string): Promise<void> {
+    await postgresService.query(
+      'UPDATE tasks SET status = $1, failure_reason = $2, updated_at = NOW() WHERE id = $3',
+      ['failed', reason, id]
+    );
+  }
+
+  /**
    * Set branch name for task
    */
   static async setBranchName(id: string, branchName: string): Promise<void> {
@@ -215,6 +253,17 @@ export class TaskRepository {
   }
 
   /**
+   * 🔥 PLANNING: Save planning result for ML training (Sentinental + Specialists)
+   * Stores uxFlows, plannedTasks, clarifications, enrichedPrompt
+   */
+  static async savePlanningResult(id: string, planningResult: any): Promise<void> {
+    await postgresService.query(
+      'UPDATE tasks SET planning_result = $1, updated_at = NOW() WHERE id = $2',
+      [JSON.stringify(planningResult), id]
+    );
+  }
+
+  /**
    * Set PR info for task
    */
   static async setPullRequest(id: string, prNumber: number, prUrl: string): Promise<void> {
@@ -239,6 +288,86 @@ export class TaskRepository {
         updated_at = NOW()
        WHERE id = $4`,
       [data.branchName, JSON.stringify(data.analysis), JSON.stringify(data.stories), id]
+    );
+  }
+
+  /**
+   * 🔥 RESUME: Mark a phase as completed (for resume after restart)
+   * Now stores approved data with each phase for display regardless of task status
+   */
+  static async markPhaseComplete(id: string, phase: string, approvedData?: Record<string, any>): Promise<void> {
+    // 🔥 Store phase with its approved data as an object, not just a string
+    const phaseEntry = {
+      phase,
+      completedAt: new Date().toISOString(),
+      approvedData: approvedData || null,
+    };
+
+    await postgresService.query(
+      `UPDATE tasks SET
+        completed_phases = COALESCE(completed_phases, '[]'::jsonb) || $1::jsonb,
+        current_phase = NULL,
+        updated_at = NOW()
+       WHERE id = $2`,
+      [JSON.stringify([phaseEntry]), id]
+    );
+  }
+
+  /**
+   * 🔥 RESUME: Set current phase being executed
+   */
+  static async setCurrentPhase(id: string, phase: string): Promise<void> {
+    await postgresService.query(
+      `UPDATE tasks SET
+        current_phase = $1,
+        updated_at = NOW()
+       WHERE id = $2`,
+      [phase, id]
+    );
+  }
+
+  /**
+   * 🔥 RESUME: Set current step and agent for precise resume
+   * Allows resuming a phase at the exact step where it was interrupted
+   */
+  static async setCurrentStep(id: string, step: number, agent: string): Promise<void> {
+    await postgresService.query(
+      `UPDATE tasks SET
+        current_step = $1,
+        current_agent = $2,
+        updated_at = NOW()
+       WHERE id = $3`,
+      [step, agent, id]
+    );
+  }
+
+  /**
+   * 🔥 RESUME: Set last completed story index (for Developer phase resume)
+   */
+  static async setLastCompletedStoryIndex(id: string, index: number): Promise<void> {
+    await postgresService.query(
+      `UPDATE tasks SET
+        last_completed_story_index = $1,
+        updated_at = NOW()
+       WHERE id = $2`,
+      [index, id]
+    );
+  }
+
+  /**
+   * 🔥 RESUME: Clear resume state when task completes or is cancelled
+   * NOTE: We do NOT clear completed_phases - that's historical data for viewing!
+   */
+  static async clearResumeState(id: string): Promise<void> {
+    await postgresService.query(
+      `UPDATE tasks SET
+        current_phase = NULL,
+        current_step = NULL,
+        current_agent = NULL,
+        last_completed_story_index = NULL,
+        updated_at = NOW()
+       WHERE id = $1`,
+      [id]
     );
   }
 

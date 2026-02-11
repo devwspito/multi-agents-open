@@ -10,6 +10,7 @@ import { authMiddleware } from './auth.js';
 import { ProjectRepository, type IProject } from '../../database/repositories/ProjectRepository.js';
 import { RepositoryRepository } from '../../database/repositories/RepositoryRepository.js';
 import { specialistManager } from '../../services/specialists/index.js';
+import { scaffoldingService } from '../../services/scaffolding/index.js';
 import {
   LLM_PROVIDERS,
   getDefaultLLMConfig,
@@ -136,6 +137,32 @@ router.post('/', async (req: Request, res: Response) => {
       }
     }
 
+    // 🏗️ Auto-scaffold for new projects
+    // Scaffolding runs when:
+    // 1. User explicitly enables it (req.body.scaffold === true), OR
+    // 2. No repositories provided (starting from scratch)
+    let scaffoldingResult = null;
+    const shouldScaffold = req.body.scaffold === true || (req.body.scaffold !== false && createdRepositories.length === 0);
+    if (shouldScaffold) {
+      try {
+        scaffoldingResult = await scaffoldingService.scaffoldProject({
+          projectId: project.id,
+          projectType: type || 'web-app',
+          provisionDatabase: req.body.provisionDatabase ?? false,
+          generateEnvFiles: req.body.generateEnvFiles ?? true,
+          createTemplates: req.body.createTemplates ?? true,
+          skipInteractive: true,
+        });
+        console.log(`[Projects] 🏗️ Scaffolding complete for ${project.id}:`, {
+          provisions: scaffoldingResult.provisions.length,
+          suggestions: scaffoldingResult.suggestions.length,
+        });
+      } catch (scaffoldError: any) {
+        console.warn(`[Projects] ⚠️ Scaffolding failed:`, scaffoldError.message);
+        // Don't fail the whole request, just skip scaffolding
+      }
+    }
+
     res.status(201).json({
       success: true,
       data: {
@@ -159,12 +186,93 @@ router.post('/', async (req: Request, res: Response) => {
             type: r.type,
           })),
         },
+        scaffolding: scaffoldingResult,
       },
       message: `Project created successfully with ${createdRepositories.length} repositories!`,
     });
   } catch (error: any) {
     console.error('[Projects] Error creating project:', error);
     res.status(500).json({ success: false, error: 'Failed to create project' });
+  }
+});
+
+/**
+ * POST /api/projects/:id/scaffold
+ * Run scaffolding for an existing project (Neon-style auto-provisioning)
+ */
+router.post('/:id/scaffold', async (req: Request, res: Response) => {
+  const userId = (req as any).userId;
+  const { provisionDatabase, templateId, stack } = req.body;
+
+  try {
+    const project = await ProjectRepository.findById(req.params.id);
+
+    if (!project || project.userId !== userId) {
+      return res.status(404).json({ success: false, error: 'Project not found' });
+    }
+
+    console.log(`[Projects] 🏗️ Running scaffolding for project ${project.id}`);
+
+    const result = await scaffoldingService.scaffoldProject({
+      projectId: project.id,
+      projectType: (project.type as any) || 'web-app',
+      stack: stack || undefined,
+      provisionDatabase: provisionDatabase ?? false,
+      generateEnvFiles: true,
+      createTemplates: true,
+      skipInteractive: true,
+    });
+
+    res.json({
+      success: result.success,
+      data: {
+        projectId: project.id,
+        provisions: result.provisions,
+        envVariables: result.envVariables.map(v => ({
+          key: v.key,
+          isSecret: v.isSecret,
+          description: v.description,
+          // Don't expose actual values
+        })),
+        templates: result.templates.map(t => ({
+          path: t.path,
+          description: t.description,
+        })),
+        suggestions: result.suggestions,
+      },
+      errors: result.errors,
+      message: result.success
+        ? `Scaffolding complete: ${result.provisions.length} resources provisioned`
+        : 'Scaffolding failed',
+    });
+  } catch (error: any) {
+    console.error('[Projects] Error scaffolding project:', error);
+    res.status(500).json({ success: false, error: 'Failed to scaffold project' });
+  }
+});
+
+/**
+ * GET /api/projects/templates
+ * Get available project templates
+ */
+router.get('/templates/list', async (req: Request, res: Response) => {
+  try {
+    const templates = scaffoldingService.getAvailableTemplates();
+
+    res.json({
+      success: true,
+      data: templates.map(t => ({
+        id: t.id,
+        name: t.name,
+        description: t.description,
+        stack: t.stack,
+        filesCount: t.files.length,
+        envVariablesCount: t.envVariables.length,
+      })),
+    });
+  } catch (error: any) {
+    console.error('[Projects] Error fetching templates:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch templates' });
   }
 });
 

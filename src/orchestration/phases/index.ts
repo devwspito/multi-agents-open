@@ -20,7 +20,7 @@ export { executeDeveloperPhase, sendUserMessage } from './DeveloperPhaseV2.js';
 export type { DeveloperPhaseContext, DeveloperResult, StoryResult } from './DeveloperPhaseV2.js';
 
 export { executeMergePhase, checkPRStatus, triggerMerge } from './MergePhaseV2.js';
-export type { MergePhaseContext, MergeResult } from './MergePhaseV2.js';
+export type { MergePhaseContext, MergeResult, RepoPullRequestInfo } from './MergePhaseV2.js';
 
 export { executeGlobalScanPhase } from './GlobalScanPhaseV2.js';
 export type { GlobalScanPhaseContext, GlobalScanResult } from './GlobalScanPhaseV2.js';
