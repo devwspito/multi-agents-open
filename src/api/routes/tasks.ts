@@ -360,6 +360,209 @@ router.post('/:taskId/start', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/tasks/:taskId/resume
+ * Resume an interrupted task from where it left off
+ *
+ * Uses stored progress (current_phase, last_completed_story_index, completed_phases)
+ * to restart the task from the appropriate phase.
+ */
+router.post('/:taskId/resume', async (req: Request, res: Response) => {
+  const userId = (req as any).userId;
+  const taskId = req.params.taskId;
+
+  const task = await TaskRepository.findById(taskId);
+  if (!task) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  // Only allow resuming interrupted tasks
+  if (task.status !== 'interrupted') {
+    return res.status(400).json({
+      error: `Cannot resume task with status '${task.status}'`,
+      hint: task.status === 'running' ? 'Task is already running' :
+            task.status === 'completed' ? 'Task already completed' :
+            'Use /start for pending tasks or /continue for paused tasks',
+    });
+  }
+
+  const project = await getProject(task.projectId!);
+  if (!project) {
+    return res.status(404).json({ error: 'Project not found' });
+  }
+
+  const githubToken = await getUserGitHubToken(userId);
+
+  // Workspace should still exist from previous run
+  const workspacePath = path.join(WORKSPACES_DIR, task.id);
+  if (!fs.existsSync(workspacePath)) {
+    return res.status(400).json({
+      error: 'Workspace not found',
+      hint: 'The workspace was deleted. Please start a new task instead.',
+    });
+  }
+
+  // Get ALL repositories for this project
+  const allRepos = await RepositoryRepository.findByProjectId(task.projectId!);
+  const repositories: RepositoryInfo[] = allRepos.map(repo => ({
+    id: repo.id,
+    name: repo.name,
+    type: repo.type,
+    localPath: path.join(workspacePath, repo.name),
+    githubUrl: repo.githubRepoUrl,
+    branch: task.branchName || repo.githubBranch,
+    description: repo.description,
+    executionOrder: repo.executionOrder,
+  }));
+
+  // Connect to OpenCode (phases will create their own sessions)
+  if (!openCodeClient.isConnected()) {
+    await openCodeClient.connect();
+  }
+
+  // Determine which phase to start from
+  let startFromPhase: 'Analysis' | 'Developer' | 'Merge' | 'GlobalScan' | undefined;
+  let preserveAnalysis = false;
+  let preserveStories = false;
+
+  // Use the stored current_phase if available
+  if (task.currentPhase) {
+    startFromPhase = task.currentPhase as any;
+    // If we're resuming Developer or later, preserve analysis
+    if (task.currentPhase !== 'Analysis') {
+      preserveAnalysis = true;
+    }
+    // If we're resuming Merge or GlobalScan, preserve stories too
+    if (task.currentPhase === 'Merge' || task.currentPhase === 'GlobalScan') {
+      preserveStories = true;
+    }
+  } else if (task.completedPhases && task.completedPhases.length > 0) {
+    // Determine next phase based on completed phases
+    const completedPhaseNames = task.completedPhases.map((p: any) =>
+      typeof p === 'string' ? p : p.phase
+    );
+
+    if (completedPhaseNames.includes('GlobalScan')) {
+      return res.status(400).json({
+        error: 'Task already completed all phases',
+        hint: 'Use /continue-with-context to start a new task with context from this one',
+      });
+    } else if (completedPhaseNames.includes('Merge')) {
+      startFromPhase = 'GlobalScan';
+      preserveAnalysis = true;
+      preserveStories = true;
+    } else if (completedPhaseNames.includes('Developer')) {
+      startFromPhase = 'Merge';
+      preserveAnalysis = true;
+      preserveStories = true;
+    } else if (completedPhaseNames.includes('Analysis')) {
+      startFromPhase = 'Developer';
+      preserveAnalysis = true;
+    } else {
+      startFromPhase = 'Analysis';
+    }
+  } else {
+    // No phase info - start from the beginning
+    startFromPhase = 'Analysis';
+  }
+
+  // Track execution
+  const execution: TaskExecution = {
+    taskId: task.id,
+    sessionId: '',
+    status: 'running',
+    startedAt: new Date(),
+  };
+  executions.set(task.id, execution);
+
+  // Update task status
+  await TaskRepository.updateStatus(task.id, 'running');
+
+  // Emit to frontend
+  socketService.toTask(task.id, 'task:resumed', {
+    taskId: task.id,
+    resumeFromPhase: startFromPhase,
+    lastCompletedStoryIndex: task.lastCompletedStoryIndex,
+  });
+
+  // Emit system message so user knows what's happening
+  socketService.toTask(task.id, 'agent:activity', {
+    id: `system-${Date.now()}`,
+    taskId: task.id,
+    type: 'system',
+    content: `Resuming task from ${startFromPhase} phase...`,
+    timestamp: new Date(),
+  });
+
+  const approvalMode = project.settings?.approvalMode || 'manual';
+  console.log(`[Tasks] 🔄 Resuming task ${task.id} from ${startFromPhase} phase (lastStoryIndex: ${task.lastCompletedStoryIndex ?? 'none'})`);
+
+  // Add task to BullMQ queue with resume options
+  const jobData: TaskJobData = {
+    taskId: task.id,
+    userId,
+    projectId: task.projectId!,
+    pipelineName: 'v2',
+    workspacePath,
+    repositories,
+    githubToken,
+    approvalMode: approvalMode as 'manual' | 'automatic',
+    priority: project.settings?.priority || 0,
+    // Resume options
+    startFromPhase: startFromPhase as any,
+    preserveAnalysis,
+    preserveStories,
+  };
+
+  const isPro = project.settings?.isPro || false;
+
+  try {
+    const job = await taskQueue.addTask(jobData, {
+      priority: jobData.priority,
+      isPro,
+    });
+
+    const position = await taskQueue.getQueuePosition(task.id);
+    const estimatedWait = await taskQueue.getEstimatedWaitTime(isPro);
+
+    console.log(`[Tasks] Task ${task.id} resumed and queued (job ${job.id}, position: ${position})`);
+
+    // Update task status to 'queued'
+    await TaskRepository.updateStatus(task.id, 'queued');
+
+    // Emit to frontend
+    socketService.toTask(task.id, 'task:queued', {
+      taskId: task.id,
+      jobId: job.id,
+      position,
+      estimatedWaitSeconds: estimatedWait,
+      isPro,
+      resumedFrom: startFromPhase,
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        taskId: task.id,
+        jobId: job.id,
+        status: 'queued',
+        position,
+        estimatedWaitSeconds: estimatedWait,
+        isPro,
+        resumedFrom: startFromPhase,
+        preserveAnalysis,
+        preserveStories,
+        lastCompletedStoryIndex: task.lastCompletedStoryIndex,
+      }
+    });
+
+  } catch (queueError: any) {
+    console.error(`[Tasks] Failed to queue resumed task ${task.id}:`, queueError.message);
+    await TaskRepository.updateStatus(task.id, 'failed');
+    return res.status(500).json({ error: `Failed to queue task: ${queueError.message}` });
+  }
+});
+
+/**
  * POST /api/tasks/:taskId/interrupt
  * Interrupt (abort) task execution - session persists for later continuation
  *
