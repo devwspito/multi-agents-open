@@ -858,15 +858,26 @@ ${buildErrors.substring(0, 3000)}
               let filesModified: string[] = [];
               let gitDiff = '';
               try {
-                // Get list of changed files (staged + unstaged)
-                filesModified = await gitService.getChangedFiles(workingDirectory);
+                // Get list of changed files (staged + unstaged) from ALL repos
+                for (const repo of repositories) {
+                  try {
+                    const repoFiles = await gitService.getChangedFiles(repo.localPath);
+                    filesModified.push(...repoFiles.map(f => `${repo.name}/${f}`));
+                  } catch {
+                    // Ignore errors for individual repos
+                  }
+                }
 
-                // Get short diff summary
-                const diffOutput = await gitService.getDiffSummary(workingDirectory);
-                gitDiff = diffOutput.substring(0, 2000); // Limit size
+                // 🔥 Get FULL diff with actual code changes (increased limit)
+                const diffOutput = await gitService.getFullDiff(workingDirectory, 300);
+                gitDiff = diffOutput.substring(0, 8000); // Increased limit for better visibility
               } catch (gitError) {
                 console.warn(`[DeveloperPhase] Could not get git info: ${gitError}`);
               }
+
+              // 🔥 Build implementation summary from judge criteria
+              const judgeResult = parseJudgeVerdict(extractFinalOutput([])); // Get current state
+              const implementationSummary = buildImplementationSummary(story, filesModified, currentResult);
 
               const approvalResponse: ApprovalResponse = await approvalService.requestApproval(
                 task.id,
@@ -887,16 +898,19 @@ ${buildErrors.substring(0, 3000)}
                   score: currentResult.score,
                   iterations: currentResult.iterations,
 
-                  // 🔥 What was done
+                  // 🔥 What was done - ENHANCED
                   filesModified,
                   filesToModify: story.filesToModify || [],
                   filesToCreate: story.filesToCreate || [],
                   gitDiff,
+                  implementationSummary, // 🔥 NEW: Human-readable summary
 
-                  // 🔥 Quality info
+                  // 🔥 Quality info - ENHANCED
                   issues: currentResult.issues,
                   vulnerabilities: currentResult.vulnerabilities.length,
                   acceptanceCriteria: story.acceptanceCriteria || [],
+                  criteriaStatus: (currentResult as any).criteriaStatus || [], // 🔥 NEW: Criteria met/unmet
+                  judgeEvaluation: (currentResult as any).summary || '', // 🔥 NEW: Judge summary
 
                   // 🔥 Session info
                   sessionId: currentResult.sessionId,
@@ -1242,6 +1256,13 @@ interface StoryExecutionResult {
   vulnerabilities: VulnerabilityV2[];
   toolCalls?: number;
   sessionId?: string;
+  // 🔥 NEW: Judge evaluation details
+  criteriaStatus?: Array<{
+    criterion: string;
+    met: boolean;
+    notes?: string;
+  }>;
+  summary?: string;
 }
 
 /**
@@ -1305,6 +1326,8 @@ async function executeStoryWithSession(
     let verdict: 'approved' | 'rejected' | 'needs_revision' = 'needs_revision';
     let score = 0;
     let issues: any[] = [];
+    let criteriaStatus: Array<{ criterion: string; met: boolean; notes?: string }> = [];
+    let judgeSummary = '';
     let iterations = 0;
     const maxIterations = 3;
     const storyVulnerabilities: VulnerabilityV2[] = [];
@@ -1373,6 +1396,8 @@ async function executeStoryWithSession(
       verdict = judgeResult.verdict;
       score = judgeResult.score;
       issues = judgeResult.issues;
+      criteriaStatus = judgeResult.criteriaStatus; // 🔥 Capture criteria status
+      judgeSummary = judgeResult.summary; // 🔥 Capture judge summary
       console.log(`[DeveloperPhase] Judge verdict: ${verdict} (score: ${score})`);
 
       // Notify frontend
@@ -1490,6 +1515,8 @@ async function executeStoryWithSession(
       vulnerabilities: storyVulnerabilities,
       toolCalls: totalToolCalls,
       sessionId,
+      criteriaStatus, // 🔥 Include criteria status
+      summary: judgeSummary, // 🔥 Include judge summary
     };
 
   } catch (error: any) {
@@ -1573,6 +1600,50 @@ function parseJudgeVerdict(output: string): {
     console.warn(`[DeveloperPhase] Failed to parse judge verdict: ${e}`);
   }
   return { verdict: 'needs_revision', score: 0, issues: [], criteriaStatus: [], summary: '' };
+}
+
+/**
+ * 🔥 Build a human-readable summary of what DEV implemented
+ */
+function buildImplementationSummary(
+  story: Story,
+  filesModified: string[],
+  result: { verdict?: string; score?: number; iterations?: number; issues?: any[] }
+): string {
+  const parts: string[] = [];
+
+  // What was the goal
+  parts.push(`Implemented "${story.title}".`);
+
+  // What files were touched
+  if (filesModified && filesModified.length > 0) {
+    const fileList = filesModified.slice(0, 5).join(', ');
+    const moreFiles = filesModified.length > 5 ? ` (+${filesModified.length - 5} more)` : '';
+    parts.push(`Modified ${filesModified.length} file(s): ${fileList}${moreFiles}.`);
+  }
+
+  // How it went
+  if (result.verdict === 'approved') {
+    parts.push(`Judge approved with score ${result.score || 0}/100.`);
+  } else if (result.verdict === 'needs_revision') {
+    parts.push(`Judge requested revisions (score: ${result.score || 0}/100).`);
+  }
+
+  // Issues found
+  if (result.issues && result.issues.length > 0) {
+    const criticalCount = result.issues.filter((i: any) => i.severity === 'critical').length;
+    const majorCount = result.issues.filter((i: any) => i.severity === 'major').length;
+    if (criticalCount > 0 || majorCount > 0) {
+      parts.push(`Found ${criticalCount} critical and ${majorCount} major issues.`);
+    }
+  }
+
+  // Iterations
+  if (result.iterations && result.iterations > 1) {
+    parts.push(`Completed after ${result.iterations} iterations.`);
+  }
+
+  return parts.join(' ');
 }
 
 /**
