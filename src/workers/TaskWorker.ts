@@ -92,6 +92,7 @@ class TaskWorkerService {
     } = job.data;
 
     console.log(`[TaskWorker] Processing task ${taskId} (job ${job.id})`);
+    console.log(`[TaskWorker] 🔐 Job data approvalMode: ${approvalMode} (from job.data.approvalMode: ${job.data.approvalMode})`);
     console.log(`[TaskWorker] Phase approval mode: ${approvalMode}`);
     if (startFromPhase) {
       console.log(`[TaskWorker] Starting from phase: ${startFromPhase} (preserveAnalysis=${preserveAnalysis}, preserveStories=${preserveStories})`);
@@ -99,6 +100,15 @@ class TaskWorkerService {
 
     // Update task status in database
     await this.updateTaskStatus(taskId, 'running');
+
+    // 🔥 Restore costs from DB if this is a resumed task (after server restart)
+    // This ensures we continue accumulating from previous totals, not from zero
+    if (startFromPhase) {
+      const restored = await costTracker.restoreCostsFromDb(taskId);
+      if (restored) {
+        console.log(`[TaskWorker] 💰 Restored previous costs from database for resumed task ${taskId}`);
+      }
+    }
 
     // Notify client via Socket.IO
     socketService.emitToUser(userId, 'task:started', {

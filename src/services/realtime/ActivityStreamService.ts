@@ -10,6 +10,7 @@
 
 import { socketService } from './SocketService.js';
 import { SOCKET_EVENTS } from '../../constants.js';
+import { TaskRepository } from '../../database/repositories/TaskRepository.js';
 
 // ============================================================================
 // TYPES
@@ -352,6 +353,25 @@ class ActivityStreamServiceClass {
     if (history.length > CONFIG.HISTORY_BUFFER_SIZE) {
       history.splice(0, history.length - CONFIG.HISTORY_BUFFER_SIZE);
     }
+
+    // 🔥 PERSIST: Save ALL activities to DB for page refresh recovery
+    // No filtering - save everything for comprehensive history
+    this.persistActivity(taskId, activity);
+  }
+
+  /**
+   * 🔥 Persist activity to database for page refresh recovery
+   */
+  private persistActivity(taskId: string, activity: Activity): void {
+    TaskRepository.appendActivityLog(taskId, {
+      type: activity.type,
+      content: activity.content.substring(0, 5000),
+      timestamp: activity.timestamp.toISOString(),
+      tool: activity.details?.toolName,
+      toolInput: activity.details,
+    }).catch(err => {
+      console.warn(`[ActivityStream] Failed to persist activity: ${err.message}`);
+    });
   }
 
   private scheduleBatchFlush(taskId: string): void {

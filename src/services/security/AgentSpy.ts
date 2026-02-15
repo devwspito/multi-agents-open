@@ -86,6 +86,12 @@ export interface Vulnerability {
   /** Category for grouping */
   category: string;
 
+  // === 🔥 CAUSALITY: Direct link to the tool call that caused this ===
+  /** Tool use ID - links directly to tool_calls table for EXACT causality */
+  toolUseId?: string;
+  /** Turn number when vulnerability was detected */
+  turnNumber?: number;
+
   // === SENTINENTAL REQUIRED FIELDS ===
   /** OWASP Top 10 category (e.g., A03:2021-Injection) */
   owaspCategory?: string;
@@ -668,10 +674,21 @@ class AgentSpyService {
   /**
    * Analyze an event and return any detected vulnerabilities
    * SYSTEMATIC: Runs ALL pattern checks on every event
+   *
+   * @param event - The OpenCode event to analyze
+   * @param context - Task context including optional toolUseId for causality tracking
    */
   analyze(
     event: OpenCodeEvent,
-    context: { taskId: string; sessionId: string; phase: string }
+    context: {
+      taskId: string;
+      sessionId: string;
+      phase: string;
+      /** 🔥 CAUSALITY: Tool use ID for direct linking to tool_calls table */
+      toolUseId?: string;
+      /** Turn number for ordering */
+      turnNumber?: number;
+    }
   ): Vulnerability[] {
     const detected: Vulnerability[] = [];
 
@@ -1072,7 +1089,18 @@ class AgentSpyService {
   }
 
   private createVulnerability(
-    context: { taskId: string; sessionId: string; phase: string; storyId?: string; workspacePath?: string; iteration?: number },
+    context: {
+      taskId: string;
+      sessionId: string;
+      phase: string;
+      storyId?: string;
+      workspacePath?: string;
+      iteration?: number;
+      /** 🔥 CAUSALITY: Tool use ID for direct linking */
+      toolUseId?: string;
+      /** Turn number for ordering */
+      turnNumber?: number;
+    },
     data: {
       severity: VulnerabilitySeverity;
       type: VulnerabilityType;
@@ -1117,6 +1145,9 @@ class AgentSpyService {
       absoluteFilePath,
       storyId: context.storyId,
       iteration: context.iteration,
+      // 🔥 CAUSALITY: Direct link to tool_calls table
+      toolUseId: context.toolUseId,
+      turnNumber: context.turnNumber,
     };
   }
 

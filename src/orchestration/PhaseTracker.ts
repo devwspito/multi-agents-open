@@ -44,6 +44,8 @@ export interface PhaseTrackingState {
     toolOutput?: any;
     success: boolean;
     timestamp: string;
+    /** 🔥 CAUSALITY: Tool use ID for linking vulnerabilities to specific tool calls */
+    toolUseId?: string;
   }>;
   turns: number;
   partialOutput: string;
@@ -133,12 +135,16 @@ export async function trackEvent(
     }
   }
 
+  // 🔥 CAUSALITY: Extract tool_use_id for linking vulnerabilities to tool calls
+  const toolUseId = event.properties?.tool_use_id || event.properties?.id;
+
   // Track tool calls
   if (event.type === 'tool.execute.before') {
     state.turns++;
     state.toolCalls.push({
       toolName: event.properties?.tool,
       toolInput: event.properties?.args,
+      toolUseId, // 🔥 Store for causality
       success: true,
       timestamp: new Date().toISOString(),
     });
@@ -153,10 +159,13 @@ export async function trackEvent(
   }
 
   // === SECURITY ANALYSIS ===
+  // 🔥 Pass toolUseId for EXACT causality linking
   const vulnerabilities = await agentSpy.analyze(event, {
     taskId: context.taskId,
     sessionId: context.sessionId,
     phase: context.phaseName,
+    toolUseId, // 🔥 CAUSALITY: Links vulnerability directly to tool_calls table
+    turnNumber: state.turns,
   });
 
   if (vulnerabilities.length > 0) {

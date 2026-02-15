@@ -380,6 +380,7 @@ export class SentinentalRepository {
       meta: {
         schemaVersion: data.schemaVersion as '3.0',
         source: data.source as 'open-multi-agents',
+        recordType: 'security',
         agentType: data.agentType,
         modelId: data.modelId,
         traceLevel: data.traceLevel,

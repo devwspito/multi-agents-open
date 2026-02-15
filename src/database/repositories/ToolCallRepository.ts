@@ -122,6 +122,8 @@ export class ToolCallRepository {
 
   /**
    * Complete a tool call with result
+   * 🔥 v2.4.1: Increased limit to 100KB for ML training
+   * Critical: We need FULL file contents for Read tools
    */
   static async complete(id: string, params: {
     toolOutput?: string;
@@ -132,12 +134,16 @@ export class ToolCallRepository {
     const existing = await this.findById(id);
     const durationMs = existing ? Date.now() - existing.startedAt.getTime() : undefined;
 
+    // 🔥 TRAINING DATA: 100KB limit for file contents
+    // Sin esto, el ML no puede ver qué leyó/escribió el agente
+    const MAX_OUTPUT_LENGTH = 100000;
+
     await postgresService.query(
       `UPDATE tool_calls
        SET tool_output = $1, tool_success = $2, tool_error = $3, bash_exit_code = $4,
            duration_ms = $5, completed_at = NOW()
        WHERE id = $6`,
-      [params.toolOutput?.substring(0, 10000) || null, params.toolSuccess, params.toolError || null, params.bashExitCode || null, durationMs || null, id]
+      [params.toolOutput?.substring(0, MAX_OUTPUT_LENGTH) || null, params.toolSuccess, params.toolError || null, params.bashExitCode || null, durationMs || null, id]
     );
   }
 

@@ -122,6 +122,43 @@ class SocketServiceClass {
       }
     }
     this.io?.to(taskId).emit(event, data);
+
+    // 🔥 PERSIST: Save important events to activity_log for page refresh recovery
+    this.persistIfImportant(taskId, event, data);
+  }
+
+  /**
+   * 🔥 Persist ALL significant events to activity_log for page refresh recovery
+   * Save everything except high-frequency noise events
+   */
+  private persistIfImportant(taskId: string, event: string, data: any): void {
+    // Skip high-frequency noise events that would bloat the DB
+    const skipEvents = [
+      'cost:update',           // Tracked separately in cost tracker
+      'typing',                // UI feedback only
+      'heartbeat', 'ping', 'pong',
+    ];
+
+    if (skipEvents.includes(event)) return;
+
+    // Skip agent:activity if it's just a duplicate (OpenCodeEventBridge already saves these)
+    // But keep it if it has unique content from phases
+    if (event === 'agent:activity' && data?.type === 'tool_call') return;
+
+    // Lazy import to avoid circular dependency
+    import('../../database/repositories/TaskRepository.js').then(({ TaskRepository }) => {
+      const content = data?.message || data?.phase || data?.content || data?.title || event;
+      TaskRepository.appendActivityLog(taskId, {
+        type: event,
+        content: typeof content === 'string' ? content.substring(0, 5000) : JSON.stringify(content).substring(0, 5000),
+        timestamp: new Date().toISOString(),
+        toolInput: data,
+      }).catch(err => {
+        console.warn(`[Socket] Failed to persist event ${event}: ${err.message}`);
+      });
+    }).catch(() => {
+      // Ignore import errors
+    });
   }
 
   /**

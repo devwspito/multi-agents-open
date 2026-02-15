@@ -494,6 +494,7 @@ router.post('/:taskId/resume', async (req: Request, res: Response) => {
   });
 
   const approvalMode = project.settings?.approvalMode || 'manual';
+  console.log(`[Tasks] 🔐 Resume: project.settings=${JSON.stringify(project.settings)}, approvalMode=${approvalMode}`);
   console.log(`[Tasks] 🔄 Resuming task ${task.id} from ${startFromPhase} phase (lastStoryIndex: ${task.lastCompletedStoryIndex ?? 'none'})`);
 
   // Add task to BullMQ queue with resume options

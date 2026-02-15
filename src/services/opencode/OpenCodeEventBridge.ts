@@ -16,6 +16,7 @@ import { openCodeClient, OpenCodeEvent } from './OpenCodeClient.js';
 import { socketService } from '../realtime/SocketService.js';
 import { TaskRepository } from '../../database/repositories/TaskRepository.js';
 import { costTracker } from '../cost/index.js';
+import { executionTracker } from '../training/ExecutionTracker.js';
 import {
   extractFilePath,
   type ToolActivityEvent,
@@ -141,119 +142,16 @@ class OpenCodeEventBridgeService extends EventEmitter {
   }
 
   /**
-   * 🔥 ML TRAINING: Only save high-value events for training
-   *
-   * What's valuable:
-   * - Tool calls (edit, bash, write, read) when COMPLETED with full input/output
-   * - Questions asked/answered
-   *
-   * What's NOISE (skip):
-   * - Streaming content chunks
-   * - "thinking" / "running" status updates
-   * - Glob/grep (too many, low value)
-   * - Session lifecycle events
-   */
-  private saveForTrainingIfValuable(taskId: string, frontendEvent: { type: string; data: any }): void {
-    const { type, data } = frontendEvent;
-
-    // 🔥 HIGH VALUE: Tool calls - but ONLY completed ones for important tools
-    if (type === 'tool_call') {
-      const toolName = (data.tool || '').toLowerCase();
-      const toolState = data.state || data.status;
-
-      // Only valuable tools
-      const valuableTools = ['edit', 'bash', 'write', 'read'];
-      if (!valuableTools.includes(toolName)) {
-        return; // Skip glob, grep, todowrite, etc.
-      }
-
-      // Only completed (with results)
-      if (toolState !== 'completed' && toolState !== 'success') {
-        return; // Skip "running" states
-      }
-
-      // Must have meaningful input
-      if (!data.input) {
-        return;
-      }
-
-      // 🔥 Save with full tool data
-      this.queueActivityLog(taskId, {
-        type: 'tool_completed',
-        content: `${toolName}: ${this.summarizeToolInput(toolName, data.input)}`,
-        tool: toolName,
-        toolState: 'completed',
-        toolInput: data.input,
-        toolOutput: data.output || data.result,
-      });
-      return;
-    }
-
-    // 🔥 HIGH VALUE: Questions (agent asking for clarification)
-    if (type === 'question_asked') {
-      this.queueActivityLog(taskId, {
-        type: 'question',
-        content: data.question || '',
-        toolInput: { question: data.question, options: data.options },
-      });
-      return;
-    }
-
-    if (type === 'question_answered') {
-      this.queueActivityLog(taskId, {
-        type: 'answer',
-        content: data.answer || '',
-        toolOutput: { answer: data.answer },
-      });
-      return;
-    }
-
-    // 🔥 MEDIUM VALUE: Final agent message (non-streaming)
-    if ((type === 'agent_message' || type === 'agent_output') && data.streaming !== true) {
-      const content = data.content || '';
-      // Only save substantial messages (not just "OK" or status updates)
-      if (content.length > 50) {
-        this.queueActivityLog(taskId, {
-          type: 'agent_response',
-          content: content.substring(0, 2000), // Limit size
-        });
-      }
-      return;
-    }
-
-    // Everything else is NOISE - don't save
-    // - streaming chunks
-    // - thinking/progress
-    // - session lifecycle
-    // - glob/grep results
-  }
-
-  /**
-   * Summarize tool input for human-readable content field
-   */
-  private summarizeToolInput(toolName: string, input: any): string {
-    if (!input) return '';
-
-    switch (toolName) {
-      case 'edit':
-        return input.file_path || 'file';
-      case 'write':
-        return input.file_path || 'file';
-      case 'read':
-        return input.file_path || 'file';
-      case 'bash':
-        const cmd = input.command || '';
-        return cmd.substring(0, 80) + (cmd.length > 80 ? '...' : '');
-      default:
-        return JSON.stringify(input).substring(0, 50);
-    }
-  }
-
-  /**
    * Register a task's OpenCode session for event forwarding
    * @param directory - The working directory where the session was created (REQUIRED for event subscription)
+   * @param meta - Optional metadata for execution tracking (agentType, modelId, phaseName, prompt)
    */
-  registerSession(taskId: string, sessionId: string, directory: string): void {
+  registerSession(
+    taskId: string,
+    sessionId: string,
+    directory: string,
+    meta?: { agentType?: string; modelId?: string; phaseName?: string; prompt?: string }
+  ): void {
     if (!directory) {
       logger.error(`[EventBridge] Cannot register session without directory!`);
       return;
@@ -267,6 +165,18 @@ class OpenCodeEventBridgeService extends EventEmitter {
     });
 
     logger.debug(`[EventBridge] Registered session ${sessionId} for task ${taskId} (dir: ${directory}, active: ${this.activeSessions.size})`);
+
+    // 🔥 Start execution tracking for ML training
+    executionTracker.startExecution({
+      taskId,
+      agentType: meta?.agentType || 'opencode',
+      modelId: meta?.modelId || 'claude-sonnet',
+      phaseName: meta?.phaseName,
+      prompt: meta?.prompt || `Session ${sessionId}`,
+      workspacePath: directory,
+    }).catch(() => {
+      // Ignore errors - might already have an active execution
+    });
 
     // Start event loop for this directory if not already running
     const existingSub = this.directorySubscriptions.get(directory);
@@ -294,7 +204,7 @@ class OpenCodeEventBridgeService extends EventEmitter {
     const session = this.activeSessions.get(sessionId);
     if (!session) return;
 
-    const { directory } = session;
+    const { directory, taskId } = session;
     this.activeSessions.delete(sessionId);
 
     // Clean up collected events for this session
@@ -304,6 +214,15 @@ class OpenCodeEventBridgeService extends EventEmitter {
     this.removeAllListeners(`event:${sessionId}`);
     this.removeAllListeners(`session:idle:${sessionId}`);
     this.removeAllListeners(`session:error:${sessionId}`);
+
+    // 🔥 Complete execution tracking for ML training
+    executionTracker.completeExecution(taskId, {
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
+    }).catch(() => {
+      // Ignore errors
+    });
 
     logger.debug(`[EventBridge] Unregistered session ${sessionId} (remaining: ${this.activeSessions.size})`);
 
@@ -483,10 +402,85 @@ class OpenCodeEventBridgeService extends EventEmitter {
       },
     });
 
-    // 🔥 ML TRAINING: Only save HIGH-VALUE events
-    // CRITICAL: Be very selective to avoid noise in training data
-    // We want: (tool, input, output) tuples for learning code actions
-    this.saveForTrainingIfValuable(taskId, frontendEvent);
+    // 🔥 COMPREHENSIVE ACTIVITY LOG: Save ALL events for UI recovery AND training
+    // No filtering - save everything to activity_log for page refresh and Sentinental training
+    this.saveForUIRecovery(taskId, frontendEvent);
+  }
+
+  /**
+   * 🔥 COMPREHENSIVE: Save ALL events for UI recovery AND training
+   * NO FILTERING - save everything except streaming chunks
+   */
+  private saveForUIRecovery(taskId: string, frontendEvent: { type: string; data: any }): void {
+    const { type, data } = frontendEvent;
+
+    // ONLY skip actual streaming content (individual chunks that will be consolidated)
+    if (data?.streaming === true && type === 'content_chunk') return;
+    if (type === 'assistant_chunk') return;
+
+    // Build comprehensive log entry
+    const toolName = (data?.tool || '').toLowerCase();
+    const toolState = data?.state || data?.status;
+    const content = data?.content || data?.message || data?.phase || '';
+
+    this.queueActivityLog(taskId, {
+      type,
+      content: typeof content === 'string' ? content.substring(0, 5000) : JSON.stringify(content).substring(0, 5000),
+      tool: toolName || undefined,
+      toolState: toolState || undefined,
+      toolInput: data?.input || data,
+      toolOutput: data?.output || data?.result,
+    });
+
+    // 🔥 EXECUTION TRACKING: Record tool calls for agent_turns/tool_calls tables
+    this.trackExecution(taskId, type, data);
+  }
+
+  /**
+   * 🔥 Track execution data for ML training (agent_turns, tool_calls tables)
+   */
+  private trackExecution(taskId: string, type: string, data: any): void {
+    // Track tool calls
+    if (type === 'tool_call') {
+      const toolName = data?.tool || 'unknown';
+      const toolState = data?.state || data?.status || 'running';
+      const toolUseId = data?.tool_use_id || data?.id || `tool-${Date.now()}`;
+
+      if (toolState === 'running' || toolState === 'started') {
+        // Tool started - record it
+        executionTracker.startToolCall(taskId, {
+          toolUseId,
+          toolName,
+          toolInput: data?.input,
+        }).catch(() => {
+          // Ignore errors - execution might not be started
+        });
+      } else if (toolState === 'completed' || toolState === 'success' || toolState === 'error') {
+        // Tool completed - update it
+        executionTracker.completeToolCall(taskId, {
+          toolUseId,
+          toolOutput: data?.output || data?.result,
+          toolSuccess: toolState !== 'error',
+          toolError: toolState === 'error' ? (data?.error || 'Unknown error') : undefined,
+        }).catch(() => {
+          // Ignore errors
+        });
+      }
+    }
+
+    // Track turns (agent messages)
+    if (type === 'agent_output' || type === 'agent_message') {
+      if (!data?.streaming) {
+        // Start a new turn and update its content
+        executionTracker.startTurn(taskId, 'assistant').then(turnId => {
+          if (turnId) {
+            executionTracker.updateTurnContent(taskId, data?.content?.substring(0, 10000) || '');
+          }
+        }).catch(() => {
+          // Ignore errors
+        });
+      }
+    }
   }
 
   /**

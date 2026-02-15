@@ -452,6 +452,8 @@ export class TaskRepository {
     timestamp?: string;
     tool?: string;
     toolState?: string;
+    toolInput?: any;  // Full tool input for UI recovery
+    toolOutput?: any; // Tool result/output
   }): Promise<void> {
     const logEntry = {
       ...entry,

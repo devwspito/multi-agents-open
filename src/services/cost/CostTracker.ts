@@ -199,6 +199,54 @@ class CostTrackerClass {
   }
 
   /**
+   * 🔥 Restore costs from database into memory when resuming a task
+   * Called when a task is resumed after server restart to continue from previous totals
+   */
+  async restoreCostsFromDb(taskId: string): Promise<boolean> {
+    // Check if already in memory (shouldn't happen but be safe)
+    if (this.taskCosts.has(taskId)) {
+      logger.info('Task costs already in memory, skipping restore', { taskId, event: 'cost_restore_skipped' });
+      return true;
+    }
+
+    const dbCost = await this.loadCostFromDb(taskId);
+    if (!dbCost) {
+      logger.info('No previous costs found in database', { taskId, event: 'cost_restore_none' });
+      return false;
+    }
+
+    // Only restore if there are actual costs
+    if (dbCost.totalCost === 0 && dbCost.totalInputTokens === 0 && dbCost.totalOutputTokens === 0) {
+      logger.info('No previous costs to restore (all zero)', { taskId, event: 'cost_restore_zero' });
+      return false;
+    }
+
+    // Restore into memory
+    const taskSummary: TaskCostSummary = {
+      taskId,
+      totalCost: dbCost.totalCost,
+      totalInputTokens: dbCost.totalInputTokens,
+      totalOutputTokens: dbCost.totalOutputTokens,
+      sessions: new Map(), // Session details are lost on restart
+      lastUpdated: new Date(),
+    };
+    this.taskCosts.set(taskId, taskSummary);
+
+    logger.info('Restored costs from database', {
+      taskId,
+      cost: dbCost.totalCost,
+      inputTokens: dbCost.totalInputTokens,
+      outputTokens: dbCost.totalOutputTokens,
+      event: 'cost_restored',
+    });
+
+    // Emit to frontend so UI shows correct totals
+    this.emitCostUpdate(taskId, taskSummary);
+
+    return true;
+  }
+
+  /**
    * Get cost summary for a task
    */
   getTaskCost(taskId: string): TaskCostSummary | null {

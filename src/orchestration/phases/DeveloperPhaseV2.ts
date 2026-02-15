@@ -1181,16 +1181,39 @@ Please implement these changes now. After making the changes, provide a summary 
 
     storyResultsV2.push(storyResultV2);
 
-    // Notify frontend
+    // Notify frontend with FULL story summary
+    // 🔥 v2.4.2: Include complete story data so users can see what was done
     socketService.toTask(task.id, 'story:complete', {
+      // Identity
       storyIndex: i,
       storyId: story.id,
       storyTitle: story.title,
+      storyDescription: story.description,
+      // Results
       success: result.verdict === 'approved',
       verdict: result.verdict,
+      score: result.score,
       iterations: result.iterations,
       commitHash: storyResultV2.commitHash,
+      // Issues - full details
+      issues: result.issues || [],
+      // Vulnerabilities - count and top details
       vulnerabilities: storyResultV2.vulnerabilities.length,
+      vulnerabilityDetails: storyResultV2.vulnerabilities.slice(0, 5).map(v => ({
+        severity: v.severity,
+        type: v.type,
+        description: v.description,
+        file: v.filePath,
+      })),
+      // Files context
+      filesToModify: story.filesToModify,
+      filesToCreate: story.filesToCreate,
+      // Acceptance criteria
+      acceptanceCriteria: story.acceptanceCriteria,
+      criteriaStatus: result.criteriaStatus,
+      // Judge summary
+      judgeSummary: result.summary,
+      // Progress
       totalStories: stories.length,
       completedStories: i + 1,
       sessionId: result.sessionId,
@@ -1209,16 +1232,41 @@ Please implement these changes now. After making the changes, provide a summary 
   const approvedCount = storyResultsV2.filter(r => r.verdict === 'approved').length;
   const totalStoryVulns = storyResultsV2.reduce((sum, s) => sum + s.vulnerabilities.length, 0);
 
-  // Notify frontend
+  // Notify frontend with FULL story data for UI display
+  // 🔥 v2.4.2: Include complete story summaries so users can see what each story did
   socketService.toTask(task.id, 'phase:complete', {
     phase: 'Developer',
     success: allApproved,
     sessionIds, // All sessions used
     stories: storyResultsV2.map(r => ({
+      // Identity
       id: r.id,
+      title: r.title,
+      description: r.description,
+      // Results
       verdict: r.verdict,
+      score: r.score,
+      iterations: r.iterations,
       commitHash: r.commitHash,
+      // Issues and vulnerabilities - full details for visibility
+      issues: r.issues || [],
       vulnerabilities: r.vulnerabilities.length,
+      vulnerabilityDetails: r.vulnerabilities.slice(0, 10).map(v => ({
+        severity: v.severity,
+        type: v.type,
+        description: v.description,
+        file: v.filePath,
+      })),
+      // Files context
+      filesToModify: r.filesToModify,
+      filesToCreate: r.filesToCreate,
+      // Acceptance criteria status
+      acceptanceCriteria: r.acceptanceCriteria,
+      // Trace info
+      durationMs: r.trace?.endTime && r.trace?.startTime
+        ? r.trace.endTime - r.trace.startTime
+        : undefined,
+      toolCalls: r.trace?.toolCalls,
     })),
     totalCommits,
     approvedCount,

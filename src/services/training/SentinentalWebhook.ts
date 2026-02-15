@@ -330,7 +330,8 @@ class SentinentalWebhookService {
       taskHistory?: TaskHistory;
     }
   ): Promise<void> {
-    if (!this.config.enabled) return;
+    // 🔥 ALWAYS save to PostgreSQL, even if external webhook is disabled
+    // The enabled flag only controls HTTP sending to external Sentinental server
     if (vulnerabilities.length === 0) return;
 
     // Filter by minimum severity
@@ -378,20 +379,23 @@ class SentinentalWebhookService {
       summary: this.buildSummary(filtered, avgCvssScore, platino?.taskHistory),
     };
 
-    // PERSIST TO POSTGRESQL FIRST (backup before HTTP send)
+    // 🔥 ALWAYS PERSIST TO POSTGRESQL (training data is always valuable)
     try {
       await SentinentalRepository.create(record);
-      console.log(`[Sentinental] Persisted record ${record.id} to PostgreSQL`);
+      console.log(`[Sentinental] ✅ Persisted record ${record.id} to PostgreSQL (${filtered.length} vulnerabilities, risk: ${record.summary.riskScore})`);
     } catch (dbError: any) {
-      console.warn(`[Sentinental] PostgreSQL persist failed (continuing with HTTP): ${dbError.message}`);
+      console.warn(`[Sentinental] PostgreSQL persist failed: ${dbError.message}`);
     }
 
-    this.buffer.push(record);
-    console.log(`[Sentinental] Buffered ${filtered.length} vulnerabilities from ${phase} [${traceLevel}] (risk: ${record.summary.riskScore}, cvss: ${avgCvssScore.toFixed(1)}) (${this.buffer.length}/${this.config.batchSize})`);
+    // Only buffer for HTTP send if external webhook is enabled
+    if (this.config.enabled) {
+      this.buffer.push(record);
+      console.log(`[Sentinental] Buffered for HTTP send (${this.buffer.length}/${this.config.batchSize})`);
 
-    // Auto-flush if batch size reached
-    if (this.buffer.length >= (this.config.batchSize || 10)) {
-      await this.flush();
+      // Auto-flush if batch size reached
+      if (this.buffer.length >= (this.config.batchSize || 10)) {
+        await this.flush();
+      }
     }
   }
 
@@ -591,11 +595,12 @@ class SentinentalWebhookService {
 
   /**
    * Legacy push method - now fetches from AgentSpy
+   * 🔥 ALWAYS saves to PostgreSQL for training data, even if external webhook is disabled
    * @deprecated Use pushSecurityData with executionContext instead
    */
   async push(taskId: string): Promise<void> {
-    if (!this.config.enabled) return;
-
+    // 🔥 Always save to PostgreSQL, even if external webhook is disabled
+    // The enabled flag only controls sending to external Sentinental server
     const summary = agentSpy.getSummary(taskId);
     if (summary.vulnerabilities.length === 0) {
       console.log(`[Sentinental] Skipped task ${taskId} (no vulnerabilities detected)`);

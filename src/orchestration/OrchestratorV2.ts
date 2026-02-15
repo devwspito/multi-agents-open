@@ -20,7 +20,7 @@
 
 import { Task, Story, RepositoryInfo, GlobalVulnerabilityScan } from '../types/index.js';
 import { TaskRepository } from '../database/repositories/TaskRepository.js';
-import { sentinentalWebhook } from '../services/training/index.js';
+import { sentinentalWebhook, trainingExportService } from '../services/training/index.js';
 import { socketService, approvalService } from '../services/realtime/index.js';
 import { cleanupTaskTracking } from './PhaseTracker.js';
 import { getProjectLLMConfig, getFullProjectLLMConfig } from '../api/routes/projects.js';
@@ -890,9 +890,15 @@ class OrchestratorV2Class {
       cacheStats: options.enableContextCache !== false ? cacheStats : undefined,
     });
 
-    // Push to Sentinental for ML training
+    // Push to Sentinental for ML training (security vulnerabilities)
     sentinentalWebhook.push(taskId).catch(err => {
       console.warn(`[OrchestratorV2] Failed to push to Sentinental: ${err.message}`);
+    });
+
+    // 🔥 Export comprehensive training data to file
+    const trainingDataDir = process.env.TRAINING_DATA_DIR || '/tmp/training-data';
+    trainingExportService.exportToFile(taskId, `${trainingDataDir}/${taskId}.json`).catch(err => {
+      console.warn(`[OrchestratorV2] Failed to export training data: ${err.message}`);
     });
 
     // Cleanup
